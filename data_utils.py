@@ -154,7 +154,7 @@ def preprocess_episode(
             f"{len(frames)} frames vs {len(actions)} actions; expected actions = frames - 1"
         )
 
-    latents = encode_latents(frames, vae, device=device, batch_size=batch_size)
+    latents = encode_latents(frames, vae, device=device, batch_size=batch_size).half()
 
     latents_path = episode_out / "latents.pt"
     actions_out_path = episode_out / "actions.one_hot.pt"
