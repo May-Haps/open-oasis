@@ -31,7 +31,7 @@ High-level behavior:
 - encodes video frames into VAE latents
 - saves processed tensors to disk
 
-### `dataloader.py`
+### `dataset.py`
 
 What it does:
 - defines the PyTorch `Dataset` used during training
@@ -81,15 +81,15 @@ python data_utils.py \
   --device cuda:0
 ```
 
-## How To Use The Dataloader
+## How To Use The Dataset
 
-`dataloader.py` is not a script you run over the whole dataset. You import it from training code.
+`dataset.py` is not a script you run over the whole dataset. You import it from training code.
 
 Example:
 
 ```python
 from torch.utils.data import DataLoader
-from dataloader import MinecraftLatentDataset
+from dataset import MinecraftLatentDataset
 
 ds = MinecraftLatentDataset(
     "/path/to/processed_treechop",
@@ -121,4 +121,4 @@ Why the difference:
 ## In One Sentence
 
 - `data_utils.py` builds the processed dataset
-- `dataloader.py` loads that processed dataset for training
+- `dataset.py` loads that processed dataset for training
