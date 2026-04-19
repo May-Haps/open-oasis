@@ -4,9 +4,10 @@ Action format derived from VPT https://github.com/openai/Video-Pre-Training
 """
 
 import math
+import av
 import torch
 from torch import nn
-from torchvision.io import read_image, read_video
+from torchvision.io import read_image
 from torchvision.transforms.functional import resize
 from einops import rearrange
 from typing import Mapping, Sequence
@@ -92,10 +93,17 @@ def load_prompt(path, video_offset=None, n_prompt_frames=1):
         # add frame dimension
         prompt = rearrange(prompt, "c h w -> 1 c h w")
     elif path.lower().split(".")[-1] in VIDEO_EXTENSIONS:
-        prompt = read_video(path, pts_unit="sec")[0]
+        decoded_frames = []
+        with av.open(path) as container:
+            for frame in container.decode(video=0):
+                decoded_frames.append(torch.from_numpy(frame.to_ndarray(format="rgb24")))
+        if not decoded_frames:
+            raise ValueError(f"No frames found in video prompt {path}")
+        prompt = torch.stack(decoded_frames, dim=0)
         if video_offset is not None:
             prompt = prompt[video_offset:]
         prompt = prompt[:n_prompt_frames]
+        prompt = rearrange(prompt, "t h w c -> t c h w")
     else:
         raise ValueError(f"unrecognized prompt file extension; expected one in {IMAGE_EXTENSIONS} or {VIDEO_EXTENSIONS}")
     assert prompt.shape[0] == n_prompt_frames, f"input prompt {path} had less than n_prompt_frames={n_prompt_frames} frames"
