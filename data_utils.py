@@ -121,6 +121,34 @@ def encode_latents(
 
     return torch.cat(outputs, dim=0)
 
+def _encode_buffer(buffer, vae, device):
+    frames = torch.stack(buffer, dim=0)
+    frames = rearrange(frames, "t h w c -> t c h w").float() / 255.0
+    frames = resize(frames, TARGET_SIZE, antialias=True).to(device)
+
+    latent_h = TARGET_SIZE[0] // vae.patch_size
+    latent_w = TARGET_SIZE[1] // vae.patch_size
+
+    with torch.no_grad():
+        latents = vae.encode(frames * 2 - 1).mean * LATENT_SCALE
+
+    latents = rearrange(latents, "b (h w) c -> b c h w", h=latent_h, w=latent_w)
+    return latents.cpu()
+
+
+def encode_video_streaming(video_path, vae, device, batch_size):
+    all_latents = []
+    buffer = []
+    with av.open(str(video_path)) as container:
+        for frame in container.decode(video=0):
+            buffer.append(torch.from_numpy(frame.to_ndarray(format="rgb24")))
+            if len(buffer) >= batch_size:
+                all_latents.append(_encode_buffer(buffer, vae, device))
+                buffer = []
+        if buffer:
+            all_latents.append(_encode_buffer(buffer, vae, device))
+    return torch.cat(all_latents, dim=0)
+
 
 def preprocess_episode(
     video_path: Path,
@@ -137,24 +165,45 @@ def preprocess_episode(
     episode_out = out_dir / episode_id
     episode_out.mkdir(parents=True, exist_ok=True)
 
-    frames = load_frames(video_path)
+    # frames = load_frames(video_path)
+    
     actions = load_actions_tensor(actions_path)
 
+    latents = encode_video_streaming(
+        video_path,
+        vae,
+        device=device,
+        batch_size=batch_size
+    ).half()
+
+    num_frames = latents.shape[0]
+
     # Raw MineRL trajectories store extra video frames; keep the first next-state-aligned segment.
-    if str(actions_path).endswith(".npz") and len(frames) >= len(actions) + 1:
-        frames = frames[: len(actions) + 1]
+    if str(actions_path).endswith(".npz") and num_frames >= len(actions) + 1:
+        # frames = frames[: len(actions) + 1]
+        latents = latents[: len(actions) + 1]
+        num_frames = latents.shape[0]
 
     # Store transition actions so each clip can prepend its own zero-action prompt frame.
-    if len(actions) == len(frames):
+    if len(actions) == num_frames:
         actions = actions[:-1]
 
-    if len(actions) != len(frames) - 1:
+    if len(actions) != num_frames - 1:
         raise ValueError(
             f"Alignment mismatch for {episode_id}: "
-            f"{len(frames)} frames vs {len(actions)} actions; expected actions = frames - 1"
+            f"{num_frames} frames vs {len(actions)} actions; expected actions = frames - 1"
         )
 
-    latents = encode_latents(frames, vae, device=device, batch_size=batch_size).half()
+    # latents = encode_latents(frames, vae, device=device, batch_size=batch_size).half()
+
+    latents = encode_video_streaming(
+        video_path,
+        vae,
+        device=device,
+        batch_size=batch_size
+    ).half()
+
+    num_frames = latents.shape[0]
 
     latents_path = episode_out / "latents.pt"
     actions_out_path = episode_out / "actions.one_hot.pt"
@@ -169,7 +218,7 @@ def preprocess_episode(
         "actions_path": str(actions_path),
         "latents_path": str(latents_path),
         "processed_actions_path": str(actions_out_path),
-        "frame_count": int(len(frames)),
+        "frame_count": int(num_frames),
         "action_count": int(len(actions)),
         "latent_shape": list(latents.shape),
         "action_shape": list(actions.shape),
@@ -178,9 +227,29 @@ def preprocess_episode(
     return meta
 
 
+# def find_pairs(input_dir: Path) -> list[tuple[Path, Path]]:
+#     pairs = []
+#     for video_path in sorted(input_dir.rglob("*.mp4")):
+#         stem = video_path.with_suffix("")
+#         preferred = [
+#             Path(str(stem) + ".one_hot_actions.pt"),
+#             Path(str(stem) + ".actions.pt"),
+#             video_path.parent / "rendered.npz",
+#         ]
+#         match = next((candidate for candidate in preferred if candidate.exists()), None)
+#         if match is not None:
+#             pairs.append((video_path, match))
+#     return pairs
+
 def find_pairs(input_dir: Path) -> list[tuple[Path, Path]]:
+    import os
     pairs = []
-    for video_path in sorted(input_dir.rglob("*.mp4")):
+    mp4_paths = []
+    for root, _, files in os.walk(input_dir, followlinks=True):
+        for name in files:
+            if name.endswith(".mp4"):
+                mp4_paths.append(Path(root) / name)
+    for video_path in sorted(mp4_paths):
         stem = video_path.with_suffix("")
         preferred = [
             Path(str(stem) + ".one_hot_actions.pt"),

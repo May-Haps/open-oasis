@@ -41,10 +41,12 @@ class ModelTrainer():
             total_iters=warmup_steps
         )
 
-    def train_epoch(self, dataset_loader: DataLoader, n_batches_per_print: int = 1000) -> float:
+        self.dtype = next(self.dit.parameters()).dtype
+
+    def train_epoch(self, dataset_loader: DataLoader, n_batches_per_print: int = 1000) -> tuple[float, list[float]]:
         return self._eval_train_loop(dataset_loader, n_batches_per_print, is_training=True)
 
-    def eval_epoch(self, dataset_loader: DataLoader, n_batches_per_print: int = 1000) -> float:
+    def eval_epoch(self, dataset_loader: DataLoader, n_batches_per_print: int = 1000) -> tuple[float, list[float]]:
         return self._eval_train_loop(dataset_loader, n_batches_per_print, is_training=False)
 
     def freeze_model_components(self) -> None:
@@ -57,7 +59,12 @@ class ModelTrainer():
     def get_scheduler(self) -> torch.optim.lr_scheduler.LinearLR:
         return self.lr_scheduler
 
-    def _eval_train_loop(self, dataset_loader: DataLoader, n_batches_per_print: int, is_training: bool) -> float:
+    def _eval_train_loop(
+            self,
+            dataset_loader: DataLoader,
+            n_batches_per_print: int,
+            is_training: bool
+    ) -> tuple[float, list[float]]:
         if is_training:
             self.dit.train()
             epoch_step_fn = self._train_step
@@ -71,12 +78,14 @@ class ModelTrainer():
 
         batch: dict[str, torch.Tensor]
 
+        loss_per_step: list[float] = []
+
         for i, batch in enumerate(dataset_loader):
             if ((i + 1) % n_batches_per_print == 0):
-                print(f'Starting batch {i + 1}/{n_batches}')
+                print(f'Starting batch {i + 1}/{n_batches} (last batch loss: {loss_per_step[-1]:5f})')
 
-            x0 = batch['latents'].to(self.device)
-            actions = batch['actions'].to(self.device)
+            x0 = batch['latents'].to(self.device, dtype=self.dtype)
+            actions = batch['actions'].to(self.device, dtype=self.dtype)
             self._validate_inputs(x0, actions)
 
             loss = epoch_step_fn(x0, actions)
@@ -84,8 +93,10 @@ class ModelTrainer():
 
             total_loss += loss * batch_size
             total_samples += batch_size
+
+            loss_per_step.append(loss)
         
-        return total_loss / total_samples
+        return total_loss / total_samples, loss_per_step
 
     def _train_step(self, x0: torch.Tensor, actions: torch.Tensor | None) -> float:
         B, T, _, _, _ = x0.size()
@@ -99,8 +110,7 @@ class ModelTrainer():
 
         with torch.autocast('cuda', dtype=torch.bfloat16):
             v_pred = self.dit(xt, t, actions)
-
-        loss = cast(torch.Tensor, self.loss_fn(v_pred, v_target))
+            loss = cast(torch.Tensor, self.loss_fn(v_pred, v_target))
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.dit.parameters(), max_norm=self.grad_clip_max_norm)
@@ -113,7 +123,6 @@ class ModelTrainer():
     def _eval_step(self, x0: torch.Tensor, actions: torch.Tensor | None) -> float:
         B, T, _, _, _ = x0.size()
 
-        
         t = torch.randint(0, self.max_noise_level, (B,T), device=self.device)
         noise = torch.randn_like(x0)
 
@@ -121,8 +130,8 @@ class ModelTrainer():
 
         with torch.autocast('cuda', dtype=torch.bfloat16):
             v_pred = self.dit(xt, t, actions)
+            loss = cast(torch.Tensor, self.loss_fn(v_pred, v_target))
 
-        loss = cast(torch.Tensor, self.loss_fn(v_pred, v_target))
         return loss.item()
 
     def _validate_inputs(self, x0, actions) -> None:

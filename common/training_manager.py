@@ -1,5 +1,4 @@
 from typing import Any, cast, TypedDict
-from datetime import datetime
 import json
 import os
 
@@ -33,11 +32,11 @@ class ModelTrainingConfig(TypedDict):
 #   aesthetic_quality: float
 #   temporal_consistency: float
 
-# TODO Should we save optimizer state?
-
 class ModelTrainingResults(TypedDict):
     train_losses: list[float]
     val_losses: list[float]
+    train_losses_per_step: list[list[float]]
+    val_losses_per_step: list[list[float]]
     #val_metrics: list[ModelEvaluationMetrics]
 
 class CheckpointState(TypedDict):
@@ -48,11 +47,11 @@ class CheckpointState(TypedDict):
 
 class TrainingManager():
     _N_DATALOADER_WORKERS = 4
-    _N_BATCHES_PER_PRINT = 1000
+    _N_BATCHES_PER_PRINT = 500
     _CKPT_FILE_PREFIX = 'ckpt'
     _TRAINING_RESULTS_FILENAME = 'training_result.json'
     _N_ROLLOUT_SAMPLES = 4
-    _N_ROLLOUT_FRAMES = 32
+    _N_ROLLOUT_FRAMES = 24
     _N_ROLLOUT_DDIM_STEPS = 8
 
     def __init__(self, dit: DiT, vae: AutoencoderKL | None, device: str = 'cuda', seed: int = 42) -> None:
@@ -71,7 +70,7 @@ class TrainingManager():
         assert config['weight_decay'] >= 0
         assert config['warmup_steps'] > 0
         assert config['grad_clip_max_norm'] > 0
-        assert self.vae is not None and config['save_dir'] is not None
+        assert not (self.vae is None and config['save_dir'] is not None)
 
         train_loader = self._build_dataloader(
             train_dir,
@@ -89,6 +88,7 @@ class TrainingManager():
         )
 
         if config['save_dir'] is not None:
+            assert self.vae is not None
             rollout_sampler = RolloutSampler(
                 dit=self.dit,
                 vae=self.vae,
@@ -125,18 +125,25 @@ class TrainingManager():
     ) -> ModelTrainingResults:
         train_losses: list[float] = []
         val_losses: list[float] = []
+        train_losses_per_step: list[list[float]] = []
+        val_losses_per_step: list[list[float]] = []
         # val_metrics: list[ModelEvaluationMetrics] = []
+
+        print(f'Training batches: {len(train_loader)}')
+        print(f'Val batches: {len(val_loader)}')
 
         for epoch in range(1, config['epochs'] + 1):
             print(f'------------------------------ Epoch {epoch}/{config['epochs']} ------------------------------')
             print(f'Starting training epoch')
-            train_loss = trainer.train_epoch(train_loader, TrainingManager._N_BATCHES_PER_PRINT)
+            train_loss, epoch_train_losses_per_step = trainer.train_epoch(train_loader, TrainingManager._N_BATCHES_PER_PRINT)
 
             print(f'Starting validation epoch')
-            val_loss = trainer.eval_epoch(val_loader)
+            val_loss, epoch_val_losses_per_step = trainer.eval_epoch(val_loader)
 
             train_losses.append(train_loss)
             val_losses.append(val_loss)
+            train_losses_per_step.append(epoch_train_losses_per_step)
+            val_losses_per_step.append(epoch_val_losses_per_step)
 
             print(f'Epoch {epoch} - train loss: {train_loss:.5f}, val loss: {val_loss:.5f}')
 
@@ -148,7 +155,12 @@ class TrainingManager():
             if config['save_dir'] is not None:
                 self._save_checkpoint(trainer, config['save_dir'], epoch)
 
-        results = self._format_results(train_losses, val_losses)
+        results = self._format_results(
+            train_losses,
+            val_losses,
+            train_losses_per_step,
+            val_losses_per_step
+        )
         # results = self._format_results(train_losses, val_losses, val_metrics)
 
         if config['save_dir'] is not None:
@@ -192,11 +204,15 @@ class TrainingManager():
             self,
             train_losses: list[float],
             val_losses: list[float],
+            train_losses_per_step: list[list[float]],
+            val_losses_per_step: list[list[float]],
             # val_metrics: list[ModelEvaluationMetrics]
     ) -> ModelTrainingResults:
         return ModelTrainingResults({
             'train_losses': train_losses,
             'val_losses': val_losses,
+            'train_losses_per_step': train_losses_per_step,
+            'val_losses_per_step': val_losses_per_step
             # 'val_metrics': val_metrics
         })
 

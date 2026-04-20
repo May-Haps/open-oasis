@@ -6,7 +6,7 @@ class NoiseScheduler:
         self.timesteps = timesteps
         self.device = device
 
-        self.beta_ts = sigmoid_beta_schedule(timesteps).to(device)
+        self.beta_ts = sigmoid_beta_schedule(timesteps).to(device, dtype=torch.float32)
         alpha_ts = 1 - self.beta_ts
         alpha_bar_ts = torch.cumprod(alpha_ts, dim=0)
         self.sqrt_alpha_bar_ts = torch.sqrt(alpha_bar_ts)
