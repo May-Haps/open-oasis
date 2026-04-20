@@ -1,4 +1,4 @@
-from typing import Any, TypedDict
+from typing import Any, cast, TypedDict
 from datetime import datetime
 import json
 import os
@@ -10,6 +10,8 @@ from torch.utils.data import DataLoader
 from dit import DiT
 from dataset import MinecraftLatentDataset
 from common.model_trainer import ModelTrainer
+from common.rollout_sampler import RolloutSampler
+from vae import AutoencoderKL
 
 class ModelTrainingConfig(TypedDict):
     max_noise_level: int
@@ -49,9 +51,15 @@ class TrainingManager():
     _N_BATCHES_PER_PRINT = 1000
     _CKPT_FILE_PREFIX = 'ckpt'
     _TRAINING_RESULTS_FILENAME = 'training_result.json'
-    def __init__(self, dit: DiT, device: str = 'cuda') -> None:
+    _N_ROLLOUT_SAMPLES = 4
+    _N_ROLLOUT_FRAMES = 32
+    _N_ROLLOUT_DDIM_STEPS = 8
+
+    def __init__(self, dit: DiT, vae: AutoencoderKL | None, device: str = 'cuda', seed: int = 42) -> None:
         self.dit = dit.to(device)
+        self.vae = vae.to(device) if vae is not None else None
         self.device = device
+        torch.manual_seed(seed)
 
     def train_model(self, train_dir: str, val_dir: str, config: ModelTrainingConfig) -> ModelTrainingResults:
         assert config['max_noise_level'] > 0 
@@ -63,6 +71,7 @@ class TrainingManager():
         assert config['weight_decay'] >= 0
         assert config['warmup_steps'] > 0
         assert config['grad_clip_max_norm'] > 0
+        assert self.vae is not None and config['save_dir'] is not None
 
         train_loader = self._build_dataloader(
             train_dir,
@@ -79,16 +88,30 @@ class TrainingManager():
             shuffle=False
         )
 
+        if config['save_dir'] is not None:
+            rollout_sampler = RolloutSampler(
+                dit=self.dit,
+                vae=self.vae,
+                val_dataset=cast(MinecraftLatentDataset, val_loader.dataset),
+                device=self.device,
+                num_samples=TrainingManager._N_ROLLOUT_SAMPLES,
+                num_frames=TrainingManager._N_ROLLOUT_FRAMES,
+                ddim_steps=TrainingManager._N_ROLLOUT_DDIM_STEPS,
+            )
+        else:
+            rollout_sampler = None
+
         trainer = ModelTrainer(
             dit=self.dit,
             max_noise_level=config['max_noise_level'],
             device=self.device,
             lr=config['lr'],
             weight_decay=config['weight_decay'],
-            warmup_steps=config['warmup_steps']
+            warmup_steps=config['warmup_steps'],
+            grad_clip_max_norm=config['grad_clip_max_norm']
         )
 
-        results = self._run_training(trainer, train_loader, val_loader, config)
+        results = self._run_training(trainer, train_loader, val_loader, rollout_sampler, config)
 
         return results
     
@@ -97,6 +120,7 @@ class TrainingManager():
             trainer: ModelTrainer,
             train_loader: DataLoader[MinecraftLatentDataset],
             val_loader: DataLoader[MinecraftLatentDataset],
+            rollout_sampler: RolloutSampler | None,
             config: ModelTrainingConfig
     ) -> ModelTrainingResults:
         train_losses: list[float] = []
@@ -116,7 +140,8 @@ class TrainingManager():
 
             print(f'Epoch {epoch} - train loss: {train_loss:.5f}, val loss: {val_loss:.5f}')
 
-            # metrics = self._compute_evaluation_metrics(val_loader)
+            self._compute_evaluation_metrics(val_loader, rollout_sampler, epoch, config['save_dir'])
+            # metrics = self._compute_evaluation_metrics(val_loader, rollout_sampler, epoch, config['save_dir'])
             # val_metrics.append(metrics)
             # self._print_evaluation_metrics(metrics)
 
@@ -130,6 +155,20 @@ class TrainingManager():
             self._save_training_results(results, config['save_dir'])
 
         return results
+
+    def _compute_evaluation_metrics(
+            self,
+            val_loader: DataLoader[MinecraftLatentDataset],
+            rollout_sampler: RolloutSampler | None,
+            epoch: int,
+            save_dir: str | None
+    ) -> None:
+        if save_dir is not None:
+            assert rollout_sampler is not None
+            print('Generating rollout samples')
+            paths = rollout_sampler.sample(epoch, save_dir)
+            for p in paths:
+                print(f'\tsaved {p}')
 
     def _build_dataloader(
             self,
