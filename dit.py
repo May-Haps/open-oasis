@@ -225,6 +225,8 @@ class DiT(nn.Module):
         self.temporal_rotary_emb = RotaryEmbedding(dim=hidden_size // num_heads)
         self.external_cond = nn.Linear(external_cond_dim, hidden_size) if external_cond_dim > 0 else nn.Identity()
 
+        self.external_cond_dim = external_cond_dim
+
         self.blocks = nn.ModuleList(
             [
                 SpatioTemporalDiTBlock(
