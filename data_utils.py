@@ -14,8 +14,8 @@ from torch import autocast
 from torchvision.transforms.functional import resize
 from tqdm import tqdm
 
-from utils import ACTION_KEYS, one_hot_actions
-from vae import VAE_models
+from dit.utils import ACTION_KEYS, one_hot_actions
+from dit.vae import VAE_models
 
 TARGET_SIZE = [360, 640]
 LATENT_SCALE = 0.07843137255

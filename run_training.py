@@ -13,10 +13,11 @@ from pathlib import Path
 from pprint import pprint
 
 import torch
-from safetensors.torch import load_model
+import torch.nn as nn
+from safetensors.torch import load_file, load_model
 
-from dit import DiT_models
-from vae import VAE_models
+from dit.action_gated_dit import ActionGatedDiT
+from dit.vae import AutoencoderKL, VAE_models
 from common.training_manager import TrainingManager, ModelTrainingConfig
 
 def set_seeds(seed: int) -> None:
@@ -27,25 +28,34 @@ def set_seeds(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-def load_dit(ckpt_path: str | None) -> torch.nn.Module:
-    model = DiT_models["DiT-S/2"]()
+def load_dit(ckpt_path: str | None) -> ActionGatedDiT:
+    
+    model = ActionGatedDiT(
+        patch_size=2,
+        hidden_size=1024,
+        depth=16, 
+        num_heads=16
+    )
+
     if ckpt_path is None:
-        print("No DiT checkpoint provided, training from scratch initialization.")
+        print("No checkpoint provided, training from scratch.")
         return model
 
-    print(f"Loading DiT from {os.path.abspath(ckpt_path)}")
+    print(f"Loading weights from {ckpt_path} into ActionGatedDiT...")
+    
     if ckpt_path.endswith(".safetensors"):
-        load_model(model, ckpt_path)
+        state_dict = load_file(ckpt_path)
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        print(f"Surgery complete. Missing keys (Action Gates): {len(missing)}")
     elif ckpt_path.endswith(".pt"):
         state = torch.load(ckpt_path, weights_only=True)
         if isinstance(state, dict) and "model" in state:
             state = state["model"]
         model.load_state_dict(state, strict=False)
-    else:
-        raise ValueError(f"Unsupported DiT checkpoint format: {ckpt_path}")
+    
     return model
 
-def load_vae(ckpt_path: str) -> torch.nn.Module:
+def load_vae(ckpt_path: str) -> AutoencoderKL:
     vae = VAE_models["vit-l-20-shallow-encoder"]()
     print(f"Loading VAE from {os.path.abspath(ckpt_path)}")
     if ckpt_path.endswith(".safetensors"):
@@ -83,18 +93,21 @@ def main() -> None:
     DEVICE = 'cuda:0'
     SEED = 0
 
+    DEBUG = True
+
     # Training hyperparameters
     CONFIG: ModelTrainingConfig = {
         "max_noise_level": 1000,
-        "clip_len": 24,
-        "clip_stride": 16,
+        "clip_len": 12,
+        "clip_stride": 8,
         "epochs": 3,
         "batch_size": 2,
         "lr": 2e-5,
         "weight_decay": 0.01,
         "warmup_steps": 1000,
         "grad_clip_max_norm": 1.0,
-        "save_dir": SAVE_DIR,
+        "trainable_components": ['action_routing', 'external_cond', 'adaLN_modulation'],
+        "save_dir": SAVE_DIR
     }
     # ==============================================================
 
@@ -110,6 +123,7 @@ def main() -> None:
         "device": DEVICE,
         "seed": SEED,
         "training_config": dict(CONFIG),
+        "debug": DEBUG
     })
 
     set_seeds(SEED)
@@ -126,7 +140,7 @@ def main() -> None:
         "seed": SEED,
     })
 
-    manager = TrainingManager(dit=dit, vae=vae, device=DEVICE)
+    manager = TrainingManager(dit=dit, vae=vae, device=DEVICE, debug=DEBUG)
     results = manager.train_model(TRAIN_DIR, VAL_DIR, CONFIG)
 
     print("\n=== Training complete ===")

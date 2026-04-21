@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from dit import DiT
+from dit.dit import DiT
 from common.noise_scheduler import NoiseScheduler
 
 class ModelTrainer():
@@ -16,7 +16,9 @@ class ModelTrainer():
             lr: float = 1e-4,
             weight_decay:float = 0.01,
             warmup_steps: int = 1000,
-            grad_clip_max_norm: float = 1.0
+            grad_clip_max_norm: float = 1.0,
+            trainable_components: list[str] = ['action_routing', 'external_cond', 'adaLN_modulation'],
+            debug: bool = False
     ) -> None:
         self.dit = dit
         self.max_noise_level = max_noise_level
@@ -30,7 +32,7 @@ class ModelTrainer():
         self.noise_scheduler = NoiseScheduler(max_noise_level, device)
         self.loss_fn = nn.MSELoss()
         
-        self.freeze_model_components()
+        self.freeze_model_components(trainable_components, debug)
 
         # NOTE Need to freeze specific parameters also maybe should do parameters groups
         self.optimizer = torch.optim.AdamW(self.dit.parameters(), lr=lr, weight_decay=weight_decay)
@@ -49,9 +51,37 @@ class ModelTrainer():
     def eval_epoch(self, dataset_loader: DataLoader, n_batches_per_print: int = 1000) -> tuple[float, list[float]]:
         return self._eval_train_loop(dataset_loader, n_batches_per_print, is_training=False)
 
-    def freeze_model_components(self) -> None:
-        # TODO decide what components we want to train
-        pass
+    def freeze_model_components(
+            self,
+            trainable_components: list[str],
+            debug: bool = False
+    ) -> list[nn.Parameter]:
+        print(f'Training restricted to keywords: {', '.join(trainable_components)}')
+        for param in self.dit.parameters():
+            param.requires_grad = False
+        
+        trainable_params: list[nn.Parameter] = []
+        for name, param in self.dit.named_parameters():
+            if any(key in name for key in trainable_components):
+                param.requires_grad = True
+                trainable_params.append(param)
+                if debug:
+                    print(f'Unfrozen: {name}')
+            elif debug:
+                print(f'Frozen: {name}')
+
+        total_params = sum(p.numel() for p in self.dit.parameters())
+        trainable_total = sum(p.numel() for p in trainable_params)
+        
+        assert total_params > 0
+
+        print(f'\n--- Freeze Report ---')
+        print(f'Total Parameters: {total_params / 1e6:.2f}M')
+        print(f'Trainable Parameters: {trainable_total / 1e6:.2f}M')
+        print(f'Fine-tuning {100 * trainable_total / total_params:.2f}% of the model.')
+        print(f'----------------------\n')
+    
+        return trainable_params
 
     def get_optimizer(self) -> torch.optim.AdamW:
         return self.optimizer

@@ -6,11 +6,11 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from dit import DiT
+from dit.dit import DiT
 from dataset import MinecraftLatentDataset
 from common.model_trainer import ModelTrainer
 from common.rollout_sampler import RolloutSampler
-from vae import AutoencoderKL
+from dit.vae import AutoencoderKL
 
 class ModelTrainingConfig(TypedDict):
     max_noise_level: int
@@ -22,6 +22,7 @@ class ModelTrainingConfig(TypedDict):
     weight_decay: float
     warmup_steps: int
     grad_clip_max_norm: float
+    trainable_components: list[str]
     save_dir: str | None
 
 # TODO
@@ -54,10 +55,18 @@ class TrainingManager():
     _N_ROLLOUT_FRAMES = 24
     _N_ROLLOUT_DDIM_STEPS = 8
 
-    def __init__(self, dit: DiT, vae: AutoencoderKL | None, device: str = 'cuda', seed: int = 42) -> None:
+    def __init__(
+            self,
+            dit: DiT,
+            vae: AutoencoderKL | None,
+            device: str = 'cuda',
+            seed: int = 42,
+            debug: bool = False
+    ) -> None:
         self.dit = dit.to(device)
         self.vae = vae.to(device) if vae is not None else None
         self.device = device
+        self.debug = debug
         torch.manual_seed(seed)
 
     def train_model(self, train_dir: str, val_dir: str, config: ModelTrainingConfig) -> ModelTrainingResults:
@@ -108,7 +117,8 @@ class TrainingManager():
             lr=config['lr'],
             weight_decay=config['weight_decay'],
             warmup_steps=config['warmup_steps'],
-            grad_clip_max_norm=config['grad_clip_max_norm']
+            grad_clip_max_norm=config['grad_clip_max_norm'],
+            debug=self.debug
         )
 
         results = self._run_training(trainer, train_loader, val_loader, rollout_sampler, config)
@@ -232,4 +242,3 @@ class TrainingManager():
         full_path = os.path.join(save_dir, TrainingManager._TRAINING_RESULTS_FILENAME)
         with open(full_path, 'w') as f:
             json.dump(results, f, indent=2)
-        

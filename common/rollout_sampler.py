@@ -7,10 +7,10 @@ from einops import rearrange
 from torch import autocast
 from torchvision.io import write_video
 
-from dit import DiT
-from vae import AutoencoderKL
+from dit.dit import DiT
+from dit.vae import AutoencoderKL
 from dataset import MinecraftLatentDataset
-from utils import sigmoid_beta_schedule
+from dit.utils import sigmoid_beta_schedule
 
 
 class RolloutSampler:
