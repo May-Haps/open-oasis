@@ -207,7 +207,7 @@ class DiT(nn.Module):
         depth=12,
         num_heads=16,
         mlp_ratio=4.0,
-        external_cond_dim=25,
+        external_cond_dim=8,
         max_frames=32,
     ):
         super().__init__()
