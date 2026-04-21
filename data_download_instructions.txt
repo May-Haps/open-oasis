@@ -60,11 +60,11 @@ python data_utils.py \
     --output-dir data/processed_treechop_train \
     --vae-ckpt models/vit-l-20.safetensors \
     --device cuda:0 \
-    --batch-size 8
+    --batch-size 16
 
 python data_utils.py \
     --input-dir data/raw/treechop_val \
     --output-dir data/processed_treechop_val \
     --vae-ckpt models/vit-l-20.safetensors \
     --device cuda:0 \
-    --batch-size 8
+    --batch-size 16
