@@ -1,0 +1,168 @@
+Assessment: Training Infrastructure for Open-OASIS
+====================================================
+
+Context
+-------
+The open-oasis repo is an inference-only release of Oasis 500M, a Minecraft world model by
+Decart/Etched. It contains the DiT and VAE architectures, DDIM sampling, and action encoding
+-- but zero training code. This document assesses what it would take to make the full training
+pipeline functional and rates difficulty for each piece.
+
+
+What Exists (Inference-Only)
+-----------------------------
+  dit.py                   DiT-S/2 model: hidden=1024, depth=12, heads=16, 12 SpatioTemporalDiTBlocks
+  vae.py                   ViT-L/20 VAE: enc_depth=6, dec_depth=12, latent_dim=16, 360x640->18x32 latents
+  attention.py             Spatial + Temporal axial attention (causal temporal)
+  rotary_embedding_torch.py  Rotary position embeddings (full implementation)
+  generate.py              DDIM sampling loop, autoregressive generation, MP4 export
+  utils.py                 Sigmoid beta schedule, action one-hot encoding (25 dims)
+
+Model I/O:
+  DiT input:  (B, T, 16, 18, 32) latents + (B, 25) actions + timesteps
+  DiT output: (B, T, 16, 18, 32) noise prediction (v-parameterization)
+  VAE:        360x640 RGB <-> 16-channel 18x32 latents
+
+
+Missing Files & Difficulty Ratings
+------------------------------------
+
+1. train.py -- Main Training Loop
+   Difficulty: Medium
+   Blocker: None
+
+   The architecture forward passes are complete. The training objective follows "Diffusion
+   Forcing": add noise to each frame independently, predict v-parameterization targets.
+
+   What to write:
+     - Sample random timestep t per frame from [0, 1000]
+     - Add noise via: sqrt(alpha_cumprod) * x + sqrt(1 - alpha_cumprod) * eps
+     - Compute v-prediction target: v = sqrt(alpha_cumprod) * eps - sqrt(1 - alpha_cumprod) * x
+     - Forward pass through DiT: predict v_hat
+     - Loss: F.mse_loss(v_hat, v)
+     - Optionally include VAE reconstruction loss + KL if fine-tuning VAE
+     - AdamW optimizer, cosine LR schedule with warmup
+
+   Notes:
+     - sigmoid_beta_schedule in utils.py is already the correct schedule
+     - DiagonalGaussianDistribution in vae.py has working kl() and sample() methods
+   Estimated lines: ~150-200
+
+
+2. dataset.py -- Minecraft Video Dataset
+   Difficulty: Hard (data acquisition is the real blocker)
+   Blocker: No public Minecraft+actions dataset
+
+   The code itself is straightforward (~100 lines):
+     - Load MP4 -> decode T+1 frames -> VAE encode -> cache latents
+     - Load .actions.pt -> one_hot_actions() -> (T, 25) tensor
+     - Sliding window sampling: random clip of length max_frames=32
+
+   The hard part is data. The original model was trained on Minecraft Contractor data from
+   OpenAI (used in VPT). This dataset:
+     - Is not publicly released in its original form
+     - Partial versions exist via the VPT IDM dataset, but Decart likely used far more
+     - Requires either recording your own gameplay (with action logging) or sourcing VPT data
+
+   Without data, this file is easy to write but useless.
+
+
+3. train_vae.py -- VAE Pre-training (optional)
+   Difficulty: Medium
+   Blocker: None (pretrained vit-l-20.safetensors checkpoint already exists)
+
+   AutoencoderKL already has all components. Standard VAE training objective:
+     - Reconstruction loss: F.mse_loss(recon, x) per pixel
+     - KL loss: posterior.kl().mean() * beta_weight
+     - Optionally perceptual loss (LPIPS) for better visual quality
+
+   Note: vae.py:329 forward() has an unused split parameter and labels arg, suggesting
+   this was anticipated but never written.
+   Estimated lines: ~100
+
+
+4. configs/ -- Hyperparameter Configs
+   Difficulty: Easy
+   Blocker: None
+
+   YAML configs for model arch and training hyperparams:
+     configs/oasis_500m.yaml  -- model arch params (derivable from DiT_models in dit.py)
+     configs/train.yaml       -- batch size, LR, warmup steps, gradient accum, checkpoint dir
+   Estimated lines: ~50 total
+
+
+5. data_utils.py -- Data Preprocessing Pipeline
+   Difficulty: Medium
+   Blocker: Requires raw Minecraft recordings
+
+   Needed to preprocess raw recordings into training-ready format:
+     - Video processing: decode MP4s with av, resize to 360x640, extract frame sequences
+     - Action processing: one_hot_actions() in utils.py:60-81 is already complete and reusable
+     - Latent caching: pre-encode all frames through VAE (critical -- encoding is expensive)
+     - Sharding: train/val splits, optionally package as WebDataset .tar shards
+   Estimated lines: ~200
+
+
+6. Distributed Training (torchrun / DDP support)
+   Difficulty: Medium
+   Blocker: None
+
+   Current code hardcodes device = "cuda:0". For 500M params, multi-GPU is required:
+     - torch.distributed init (torchrun / NCCL backend)
+     - DistributedDataParallel wrapper around DiT
+     - Gradient synchronization across ranks
+     - Rank-0-only checkpoint saving and logging
+
+   The architecture has no distributed-unfriendly components. Standard DDP wrapping works.
+
+
+7. evaluate.py -- Evaluation Metrics
+   Difficulty: Medium
+   Blocker: None
+
+   Standard video generation metrics:
+     - FVD (Frechet Video Distance) -- requires I3D features via torchvideo or tensorflow_hub
+     - LPIPS per-frame perceptual similarity
+     - Action consistency: does the generated video follow the given action sequence?
+
+   generate.py already has the full sampling pipeline; evaluation can wrap it directly.
+
+
+Difficulty Summary
+-------------------
+  train.py training loop        Medium    None -- architecture is complete
+  dataset.py data loader        Hard      No public Minecraft+actions dataset
+  train_vae.py VAE training     Medium    None (pretrained checkpoint exists)
+  configs/                      Easy      None
+  data_utils.py preprocessing   Medium    Requires raw data
+  Distributed training support  Medium    None
+  evaluate.py                   Medium    None
+
+
+Critical Path
+--------------
+The single largest blocker is Minecraft gameplay data with synchronized action logs.
+The training code can be written in ~500 lines total. Without a large-scale dataset of
+Minecraft recordings paired with keyboard/mouse action streams (tens of thousands of hours,
+per the Oasis blog post), the model cannot be trained to match the released checkpoint quality.
+
+Practical paths to data:
+  1. Record your own: MineRL or Malmo platform can record gameplay + actions simultaneously.
+     Feasible for small-scale experiments and fine-tuning.
+  2. OpenAI VPT IDM dataset: A partial public release alongside the VPT paper.
+     Sufficient for prototyping but much smaller than what Decart used.
+  3. Fine-tune existing checkpoint: Use oasis500m.safetensors as a starting point and
+     fine-tune on a smaller domain-specific dataset. Most tractable path.
+
+
+Recommended Implementation Order
+----------------------------------
+  1. configs/train.yaml             (Easy -- enables everything else)
+  2. train.py                       (Medium -- smoke-test with random tensors before needing data)
+  3. data_utils.py                  (Medium -- build preprocessing for available data source)
+  4. dataset.py                     (Hard -- gated on data acquisition)
+  5. Distributed training support   (Medium -- integrate into train.py)
+  6. evaluate.py                    (Medium -- can be done in parallel with above)
+
+The training loop + configs can be smoke-tested with random tensors to verify gradients flow
+correctly before any real data is acquired.
