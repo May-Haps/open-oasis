@@ -207,9 +207,13 @@ class DiT(nn.Module):
         num_heads=16,
         mlp_ratio=4.0,
         external_cond_dim=25,
+        external_cond_dropout=0.1,
         max_frames=32,
     ):
         super().__init__()
+        if not 0.0 <= external_cond_dropout <= 1.0:
+            raise ValueError(f"external_cond_dropout must be in [0, 1], got {external_cond_dropout}")
+
         self.in_channels = in_channels
         self.out_channels = in_channels
         self.patch_size = patch_size
@@ -222,10 +226,18 @@ class DiT(nn.Module):
 
         self.spatial_rotary_emb = RotaryEmbedding(dim=hidden_size // num_heads // 2, freqs_for="pixel", max_freq=256)
         self.temporal_rotary_emb = RotaryEmbedding(dim=hidden_size // num_heads)
-        self.external_cond = (nn.Sequential(nn.Linear(external_cond_dim, hidden_size),nn.Dropout(p=0.1),) if external_cond_dim > 0 else nn.Identity())
+        self.external_cond = (
+            nn.Sequential(
+                nn.Linear(external_cond_dim, hidden_size),
+                nn.Dropout(p=external_cond_dropout),
+            )
+            if external_cond_dim > 0
+            else nn.Identity()
+        )
 
 
         self.external_cond_dim = external_cond_dim
+        self.external_cond_dropout = external_cond_dropout
 
         self.blocks = nn.ModuleList(
             [
@@ -322,7 +334,7 @@ class DiT(nn.Module):
         return x
 
 
-def MarioWorldModel():
+def MarioWorldModel(external_cond_dropout: float = 0.1):
     """Pixel-space DiT for 64×64 Mario frames. ~15M params."""
     return DiT(
         input_h=64,
@@ -333,11 +345,12 @@ def MarioWorldModel():
         depth=6,
         num_heads=4,
         external_cond_dim=8,
+        external_cond_dropout=external_cond_dropout,
         max_frames=32,
     )
 
 
-def CoinRunWorldModel():
+def CoinRunWorldModel(external_cond_dropout: float = 0.1):
     """
     Pixel-space DiT for 64×64 CoinRun frames. ~100M params.
     15 discrete Procgen actions (one-hot).
@@ -352,11 +365,12 @@ def CoinRunWorldModel():
         depth=8,
         num_heads=8,
         external_cond_dim=15,
+        external_cond_dropout=external_cond_dropout,
         max_frames=32,
     )
 
 
-def CoinRunWorldModelSmall():
+def CoinRunWorldModelSmall(external_cond_dropout: float = 0.1):
     """
     Pixel-space DiT for 64×64 CoinRun frames. ~60M params.
     Same architecture as CoinRunWorldModel but hidden=512, depth=6.
@@ -372,5 +386,6 @@ def CoinRunWorldModelSmall():
         depth=6,
         num_heads=8,
         external_cond_dim=15,
+        external_cond_dropout=external_cond_dropout,
         max_frames=32,
     )

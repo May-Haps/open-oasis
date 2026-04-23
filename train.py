@@ -51,6 +51,7 @@ def main() -> None:
         "trainable_components": [],   # empty = train all
         "save_dir":           SAVE_DIR,
     }
+    ACTION_COND_DROPOUT = 0.1  # Set to 0.0 to disable action-conditioning dropout.
     # ==============================================================
 
     assert torch.cuda.is_available(), "CUDA is required."
@@ -67,7 +68,7 @@ def main() -> None:
 
     set_seeds(SEED)
 
-    dit = MarioWorldModel()
+    dit = MarioWorldModel(external_cond_dropout=ACTION_COND_DROPOUT)
 
     if CKPT is not None:
         state = torch.load(CKPT, weights_only=True)
@@ -79,7 +80,17 @@ def main() -> None:
     if SAVE_DIR is not None:
         Path(SAVE_DIR).mkdir(parents=True, exist_ok=True)
         with open(os.path.join(SAVE_DIR, "run_config.json"), "w") as f:
-            json.dump({"config": dict(CONFIG), "ckpt": CKPT, "device": DEVICE, "seed": SEED}, f, indent=2)
+            json.dump(
+                {
+                    "config": dict(CONFIG),
+                    "action_cond_dropout": ACTION_COND_DROPOUT,
+                    "ckpt": CKPT,
+                    "device": DEVICE,
+                    "seed": SEED,
+                },
+                f,
+                indent=2,
+            )
 
     manager = TrainingManager(dit=dit, device=DEVICE, seed=SEED, debug=DEBUG)
     results = manager.train_model(TRAIN_DIR, VAL_DIR, CONFIG)

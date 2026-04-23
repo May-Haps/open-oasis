@@ -54,6 +54,7 @@ CONFIG = {
 
     # Model
     "max_noise_level": 1000,
+    "action_cond_dropout": 0.1,  # Set to 0.0 to disable action-conditioning dropout.
 
     # Data
     "clip_len":   32,
@@ -440,7 +441,9 @@ def main(args):
         (save_dir / "wandb_run_id.txt").write_text(run.id)
 
     # --- Model ---
-    raw_model = CoinRunWorldModelSmall().to(device)
+    raw_model = CoinRunWorldModelSmall(
+        external_cond_dropout=CONFIG["action_cond_dropout"]
+    ).to(device)
     if is_main:
         print(f"Parameters: {sum(p.numel() for p in raw_model.parameters()) / 1e6:.1f}M")
     model = DDP(raw_model, device_ids=[local_rank]) if is_ddp else raw_model
