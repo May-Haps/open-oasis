@@ -37,11 +37,15 @@ class CoinRunStreamingDataset(IterableDataset):
         clip_len: int = 32,
         stride: int = 8,
         seed: int = 42,
+        ddp_rank: int = 0,
+        ddp_world_size: int = 1,
     ) -> None:
         self.shard_dir = Path(shard_dir)
         self.clip_len = clip_len
         self.stride = stride
         self.seed = seed
+        self.ddp_rank = ddp_rank
+        self.ddp_world_size = ddp_world_size
 
         self.shards = sorted(self.shard_dir.glob("*.array_record"))
         if not self.shards:
@@ -86,15 +90,12 @@ class CoinRunStreamingDataset(IterableDataset):
         except ImportError:
             raise ImportError("pip install array-record")
 
-        import torch.distributed as dist
-
         worker = get_worker_info()
         shards = list(self.shards)
 
-        # split shards across DDP ranks first, then across DataLoader workers
-        if dist.is_available() and dist.is_initialized():
-            rank, world_size = dist.get_rank(), dist.get_world_size()
-            shards = shards[rank::world_size]
+        # split shards across DDP ranks (rank passed explicitly — dist not available in spawned workers)
+        if self.ddp_world_size > 1:
+            shards = shards[self.ddp_rank :: self.ddp_world_size]
 
         if worker is not None:
             shards = shards[worker.id :: worker.num_workers]

@@ -34,14 +34,16 @@ else
     conda create -y -n "${ENV_NAME}" python=3.11
 fi
 
-# Run all pip installs inside the env
-CONDA_RUN="conda run -n ${ENV_NAME} --no-capture-output"
+# Activate the env for all subsequent installs
+# shellcheck source=/dev/null
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate "${ENV_NAME}"
 
 # ---------------------------------------------------------------------------
 # PyTorch
 # ---------------------------------------------------------------------------
 echo "[2/5] Installing PyTorch (cu${CUDA_VERSION}) ..."
-$CONDA_RUN pip install --quiet \
+pip install --quiet \
     torch torchvision \
     --index-url "${TORCH_INDEX}"
 
@@ -49,7 +51,7 @@ $CONDA_RUN pip install --quiet \
 # Core dependencies
 # ---------------------------------------------------------------------------
 echo "[3/5] Installing core dependencies ..."
-$CONDA_RUN pip install --quiet \
+pip install --quiet \
     einops \
     diffusers \
     timm \
@@ -61,7 +63,7 @@ $CONDA_RUN pip install --quiet \
 # CoinRun data preprocessing
 # ---------------------------------------------------------------------------
 echo "[4/5] Installing CoinRun preprocessing dependencies ..."
-$CONDA_RUN pip install --quiet \
+pip install --quiet \
     array-record \
     grain-nightly \
     huggingface_hub \
@@ -72,7 +74,7 @@ $CONDA_RUN pip install --quiet \
 # Verify
 # ---------------------------------------------------------------------------
 echo "[5/5] Verifying installation ..."
-$CONDA_RUN python - <<'EOF'
+python - <<'EOF'
 import torch, einops, timm, wandb, tqdm, huggingface_hub
 print(f"  torch      {torch.__version__}")
 print(f"  CUDA avail {torch.cuda.is_available()}")

@@ -27,7 +27,10 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import av
 import wandb
+from PIL import Image as PILImage, ImageDraw, ImageFont
+from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 from tqdm import tqdm
 from einops import rearrange
 from torch import autocast
@@ -58,17 +61,18 @@ CONFIG = {
 
     # Training
     "epochs":          10,       # stop early if time budget hit; checkpoints preserve progress
-    "batch_size":      8,
+    "batch_size":      128,
     "lr":              1e-4,
     "weight_decay":    0.01,
     "warmup_steps":    2000,
     "grad_clip":       1.0,
 
     # Logging / saving
-    "ckpt_every_steps":    2000,   # checkpoint every ~8-10 min on H100
-    "rollout_every_steps": 5000,   # generate + log video every ~20-25 min
+    "ckpt_every_steps":    10000,  # checkpoint every ~8 min at ~20 it/s
+    "rollout_every_steps": 1000,   # generate + log video every ~1k steps
+    "val_every_steps":     5000,   # fast val loss (subset) every N steps
+    "val_subset_batches":  50,     # how many val batches for the fast check (~8s)
     "log_every_steps":     50,     # wandb loss every N steps
-    "val_every_epoch":     True,
 
     # Rollout generation
     "ddim_steps":          10,
@@ -136,7 +140,7 @@ def generate_rollout(
             an[:, :-1] = 1.0
             if noise_idx == 1:
                 an[:, -1:] = 1.0
-            x[:, -1:] = an.sqrt() * x_start + x_noise * (1 - an).sqrt()
+            x[:, -1:] = (an.sqrt() * x_start + x_noise * (1 - an).sqrt())[:, -1:]
 
     out = (x.clamp(-1, 1) + 1) / 2                              # [B, T, 3, 64, 64] float
     out = rearrange(out, "b t c h w -> b t h w c")
@@ -145,6 +149,111 @@ def generate_rollout(
     if was_training:
         model.train()
     return out
+
+
+# ---------------------------------------------------------------------------
+# Keyboard overlay helpers (shared with infer_coinrun.py)
+# ---------------------------------------------------------------------------
+_FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+try:
+    _FONT_SM  = ImageFont.truetype(_FONT_PATH, 14)
+    _FONT_MD  = ImageFont.truetype(_FONT_PATH, 18)
+    _FONT_XS  = ImageFont.truetype(_FONT_PATH, 8)   # compact overlay at native 64px
+    _FONT_KEY = ImageFont.truetype(_FONT_PATH, 9)
+except OSError:
+    _FONT_SM = _FONT_MD = _FONT_XS = _FONT_KEY = ImageFont.load_default()
+
+ACTION_NAMES = [
+    "LEFT+DOWN", "LEFT", "LEFT+UP", "DOWN", "NOOP",
+    "UP", "RIGHT+DOWN", "RIGHT", "RIGHT+UP",
+    "D", "A", "W", "S", "Q", "E",
+]
+ACTION_KEYS = [
+    (True,  False, False, True),  (True,  False, False, False),
+    (True,  False, True,  False), (False, False, False, True),
+    (False, False, False, False), (False, False, True,  False),
+    (False, True,  False, True),  (False, True,  False, False),
+    (False, True,  True,  False),
+    *([(False, False, False, False)] * 6),
+]
+_BG      = (15, 15, 20)
+_KEY_OFF = (55, 55, 65)
+_KEY_ON  = (255, 210, 40)
+_DIM     = (150, 150, 165)
+_BRIGHT  = (255, 210, 40)
+
+
+def _draw_keyboard(draw: ImageDraw.Draw, action: int, panel_w: int, y0: int) -> None:
+    """D-pad sized to fit inside panel_w (designed for 64px columns)."""
+    left, right, up, down = ACTION_KEYS[action]
+    ksz, gap = 10, 2        # key size chosen so 3 keys fit in 64px (10+2+10+2+10=34)
+    step = ksz + gap
+    cx = panel_w // 2       # 32 for 64px column
+    cy_top = y0 + 6
+    cy_bot = cy_top + step
+    for kx, ky, active, label in [
+        (cx,        cy_top, up,    "^"),
+        (cx - step, cy_bot, left,  "<"),
+        (cx,        cy_bot, down,  "v"),
+        (cx + step, cy_bot, right, ">"),
+    ]:
+        fill    = _KEY_ON if active else _KEY_OFF
+        outline = (210, 170, 10) if active else (100, 100, 115)
+        draw.rectangle([kx - ksz//2, ky - ksz//2, kx + ksz//2, ky + ksz//2],
+                       fill=fill, outline=outline, width=1)
+        draw.text((kx, ky), label, font=_FONT_KEY,
+                  fill=(10, 10, 10) if active else _DIM, anchor="mm")
+    # action name centred below d-pad
+    name = ACTION_NAMES[action] if action < len(ACTION_NAMES) else str(action)
+    draw.text((cx, cy_bot + ksz//2 + 5), name, font=_FONT_XS, fill=_BRIGHT, anchor="mt")
+
+
+def _build_frame(gt_f, gen_f, action: int, scale: int, panel_h: int) -> np.ndarray:
+    """gt_f / gen_f: uint8 [64, 64, 3]. Returns composite column array."""
+    fw, fh = 64 * scale, 64 * scale
+    canvas = PILImage.new("RGB", (fw, fh * 2 + panel_h), _BG)
+    canvas.paste(PILImage.fromarray(gt_f).resize((fw, fh),  PILImage.NEAREST), (0, 0))
+    canvas.paste(PILImage.fromarray(gen_f).resize((fw, fh), PILImage.NEAREST), (0, fh))
+    draw = ImageDraw.Draw(canvas)
+    draw.line([(0, fh),     (fw, fh)],     fill=(60, 60, 80), width=2)
+    draw.line([(0, fh * 2), (fw, fh * 2)], fill=(40, 40, 55), width=1)
+    _draw_keyboard(draw, action, fw, fh * 2 + 4)
+    return np.array(canvas)
+
+
+def save_rollout_mp4(
+    frames: torch.Tensor,
+    path: str,
+    gt: torch.Tensor | None = None,
+    actions: torch.Tensor | None = None,  # int [B, T]
+    fps: int = 15,
+    panel_h: int = 80,
+) -> None:
+    """frames/gt: uint8 [B, T, H, W, C]. GT top, generated bottom, keyboard panel below."""
+    B, T = frames.shape[:2]
+    col_w = 64
+    col_h = 64 * 2 + panel_h
+
+    container = av.open(path, mode="w")
+    stream = container.add_stream("libx264", rate=fps)
+    stream.width, stream.height = col_w * B, col_h
+    stream.pix_fmt = "yuv420p"
+    stream.options = {"crf": "18", "preset": "fast"}
+
+    for t in range(T):
+        columns = []
+        for b in range(B):
+            gt_f   = gt[b, t].numpy()     if gt      is not None else np.zeros((64, 64, 3), np.uint8)
+            gen_f  = frames[b, t].numpy()
+            action = int(actions[b, t])   if actions is not None else 4
+            columns.append(_build_frame(gt_f, gen_f, action, scale=1, panel_h=panel_h))  # scale=1: no upscale
+        row = np.concatenate(columns, axis=1)
+        for pkt in stream.encode(av.VideoFrame.from_ndarray(row, format="rgb24")):
+            container.mux(pkt)
+
+    for pkt in stream.encode():
+        container.mux(pkt)
+    container.close()
 
 
 def frames_to_grid(generated: torch.Tensor, ground_truth: torch.Tensor) -> np.ndarray:
@@ -243,22 +352,54 @@ def val_epoch(
     loader: DataLoader,
     noise_scheduler: NoiseScheduler,
     device: str,
-) -> float:
+    alphas_cumprod: torch.Tensor | None = None,
+    max_batches: int | None = None,
+) -> tuple[float, float, float]:
+    """Returns (val_loss, psnr, ssim). Pass max_batches for a fast subset check."""
     model.eval()
-    total, n = 0.0, 0
-    for batch in loader:
-        x0      = batch["frames"].to(device)
+    loss_total, n = 0.0, 0
+    gt_frames, pred_frames = [], []
+
+    for i, batch in enumerate(loader):
+        if max_batches is not None and i >= max_batches:
+            break
+        x0      = batch["frames"].to(device)          # [B, T, 3, 64, 64] in [0, 1]
         actions = batch["actions"].to(device)
         B, T    = x0.shape[:2]
         t       = torch.randint(0, noise_scheduler.timesteps, (B, T), device=device)
         noise   = torch.randn_like(x0)
-        xt, v_target = noise_scheduler.noised_sample_and_velocity_target(x0 * 2 - 1, t, noise)
+        x0_scaled = x0 * 2 - 1                        # [-1, 1]
+        xt, v_target = noise_scheduler.noised_sample_and_velocity_target(x0_scaled, t, noise)
         with autocast("cuda", dtype=torch.bfloat16):
             v_pred = model(xt, t, actions)
-        total += nn.functional.mse_loss(v_pred, v_target).item() * B
+        loss_total += nn.functional.mse_loss(v_pred, v_target).item() * B
         n += B
+
+        # recover x0 prediction for pixel-space metrics
+        if alphas_cumprod is not None:
+            ac = alphas_cumprod[t]                     # [B, T, 1, 1, 1]
+            x0_pred = ac.sqrt() * xt - (1 - ac).sqrt() * v_pred.float()
+            # [B, T, 3, 64, 64] → [B*T, 64, 64, 3] uint8
+            x0_pred = ((x0_pred.clamp(-1, 1) + 1) / 2 * 255).byte()
+            x0_pred = x0_pred.permute(0, 1, 3, 4, 2).reshape(-1, 64, 64, 3).cpu().numpy()
+            x0_gt   = (x0 * 255).byte().permute(0, 1, 3, 4, 2).reshape(-1, 64, 64, 3).cpu().numpy()
+            gt_frames.append(x0_gt)
+            pred_frames.append(x0_pred)
+
     model.train()
-    return total / n
+    val_loss = loss_total / n
+
+    if alphas_cumprod is None or not gt_frames:
+        return val_loss, float("nan"), float("nan")
+
+    gt_all   = np.concatenate(gt_frames,   axis=0).astype(np.float32)
+    pred_all = np.concatenate(pred_frames, axis=0).astype(np.float32)
+    psnr = peak_signal_noise_ratio(gt_all, pred_all, data_range=255)
+    ssim = float(np.mean([
+        structural_similarity(gt_all[i], pred_all[i], data_range=255, channel_axis=-1)
+        for i in range(len(gt_all))
+    ]))
+    return val_loss, psnr, ssim
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +444,7 @@ def main(args):
     if is_main:
         print(f"Parameters: {sum(p.numel() for p in raw_model.parameters()) / 1e6:.1f}M")
     model = DDP(raw_model, device_ids=[local_rank]) if is_ddp else raw_model
+    model = torch.compile(model)
 
     # --- Optimiser ---
     optimizer = torch.optim.AdamW(
@@ -322,25 +464,35 @@ def main(args):
     alphas_cumprod = rearrange(torch.cumprod(1.0 - betas, dim=0), "T -> T 1 1 1")
 
     # --- Data ---
-    train_ds = CoinRunStreamingDataset(CONFIG["train_dir"], CONFIG["clip_len"], CONFIG["clip_stride"])
-    val_ds   = CoinRunStreamingDataset(CONFIG["val_dir"],   CONFIG["clip_len"], CONFIG["clip_stride"], seed=0)
+    train_ds = CoinRunStreamingDataset(CONFIG["train_dir"], CONFIG["clip_len"], CONFIG["clip_stride"],
+                                       ddp_rank=local_rank, ddp_world_size=world_size)
+    val_ds   = CoinRunStreamingDataset(CONFIG["val_dir"],   CONFIG["clip_len"], CONFIG["clip_stride"], seed=0,
+                                       ddp_rank=local_rank, ddp_world_size=world_size)
 
     train_loader = DataLoader(train_ds, batch_size=CONFIG["batch_size"],
-                              num_workers=4, multiprocessing_context="spawn")
+                              num_workers=16, pin_memory=True, multiprocessing_context="spawn")
     val_loader   = DataLoader(val_ds,   batch_size=CONFIG["batch_size"] // 4,
-                              num_workers=2, multiprocessing_context="spawn")
+                              num_workers=4, pin_memory=True, multiprocessing_context="spawn")
 
-    # Fixed val prompts for visual logging (rank 0 only)
+    # Pre-collect a pool of val clips for visual logging (rank 0 only)
     if is_main:
-        val_samples = []
+        val_pool = []
         for item in val_ds:
-            val_samples.append(item)
-            if len(val_samples) >= CONFIG["n_rollout_samples"]:
+            val_pool.append(item)
+            if len(val_pool) >= 200:
                 break
-        prompt_frames  = torch.stack([s["frames"][:CONFIG["n_prompt_frames"]] for s in val_samples])
-        prompt_actions = torch.stack([s["actions"][:CONFIG["rollout_frames"]]  for s in val_samples])
-        gt_frames      = torch.stack([s["frames"][:CONFIG["rollout_frames"]]   for s in val_samples])
-        gt_uint8 = (rearrange(gt_frames, "b t c h w -> b t h w c") * 255).byte()
+        rng_rollout = torch.Generator()
+
+    def sample_val_prompts(seed: int):
+        """Randomly sample n_rollout_samples clips from val_pool."""
+        rng_rollout.manual_seed(seed)
+        idx = torch.randperm(len(val_pool), generator=rng_rollout)[:CONFIG["n_rollout_samples"]]
+        chosen = [val_pool[i] for i in idx.tolist()]
+        pf  = torch.stack([s["frames"][:CONFIG["n_prompt_frames"]] for s in chosen])
+        pa  = torch.stack([s["actions"][:CONFIG["rollout_frames"]]  for s in chosen])
+        gtf = torch.stack([s["frames"][:CONFIG["rollout_frames"]]   for s in chosen])
+        gt  = (rearrange(gtf, "b t c h w -> b t h w c") * 255).byte()
+        return pf, pa, gt
 
     # --- Resume ---
     start_epoch, global_step, best_val = 0, 0, float("inf")
@@ -365,7 +517,7 @@ def main(args):
     for epoch in range(start_epoch, CONFIG["epochs"]):
         epoch_loss, epoch_steps = 0.0, 0
 
-        total_batches = len(train_ds) // (CONFIG["batch_size"] * world_size)
+        total_batches = len(train_ds) // (CONFIG["batch_size"] * world_size)  # len() returns full dataset size; dataset already sharded by rank
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}", total=total_batches,
                     dynamic_ncols=True, disable=not is_main)
         for batch in pbar:
@@ -389,6 +541,15 @@ def main(args):
                         "perf/steps_per_sec": global_step / (time.time() - t0),
                     }, step=global_step)
 
+                # --- Fast val loss (subset) ---
+                if global_step % CONFIG["val_every_steps"] == 0:
+                    fast_loss, _, _ = val_epoch(
+                        model, val_loader, noise_scheduler, device,
+                        alphas_cumprod=None,
+                        max_batches=CONFIG["val_subset_batches"],
+                    )
+                    wandb.log({"val/loss": fast_loss}, step=global_step)
+
                 # --- Checkpoint ---
                 if global_step % CONFIG["ckpt_every_steps"] == 0:
                     ckpt_path = str(save_dir / f"ckpt_step_{global_step:07d}.pt")
@@ -399,6 +560,13 @@ def main(args):
 
                 # --- Rollout visual log ---
                 if global_step % CONFIG["rollout_every_steps"] == 0:
+                    prompt_frames, prompt_actions, gt_uint8 = sample_val_prompts(global_step)
+
+                    # recover int action indices from one-hot
+                    has_action    = prompt_actions.sum(dim=-1) > 0
+                    action_idx    = prompt_actions.argmax(dim=-1)
+                    action_idx[~has_action] = 4   # NOOP for zero-pad frame
+
                     generated = generate_rollout(
                         raw_model, prompt_frames, prompt_actions,
                         alphas_cumprod, device,
@@ -406,33 +574,37 @@ def main(args):
                         total_frames=CONFIG["rollout_frames"],
                         n_prompt=CONFIG["n_prompt_frames"],
                     )
-                    for i in range(CONFIG["n_rollout_samples"]):
-                        wandb.log({
-                            f"rollout/video_{i}": wandb.Video(
-                                generated[i].numpy(), fps=15, format="mp4"
-                            ),
-                        }, step=global_step)
-                    grid = frames_to_grid(generated, gt_uint8)
-                    wandb.log({"rollout/grid": wandb.Image(grid)}, step=global_step)
+
+                    rollout_dir = save_dir / "rollouts"
+                    rollout_dir.mkdir(exist_ok=True)
+                    local_path = str(rollout_dir / f"rollout_step_{global_step:07d}.mp4")
+                    save_rollout_mp4(generated, local_path, gt=gt_uint8, actions=action_idx)
+                    wandb.log({
+                        "rollout/video": wandb.Video(local_path),
+                        "rollout/grid":  wandb.Image(frames_to_grid(generated, gt_uint8)),
+                    }, step=global_step)
+                    print(f"[step {global_step}] rollout saved → {local_path}")
 
         # --- End of epoch ---
         avg_train_loss = epoch_loss / max(epoch_steps, 1)
-        val_loss = val_epoch(model, val_loader, noise_scheduler, device)
+        val_loss, psnr, ssim = val_epoch(model, val_loader, noise_scheduler, device, alphas_cumprod)
 
-        # aggregate val loss across ranks
+        # aggregate metrics across ranks
         if is_ddp:
-            val_tensor = torch.tensor(val_loss, device=device)
-            dist.all_reduce(val_tensor, op=dist.ReduceOp.AVG)
-            val_loss = val_tensor.item()
+            metrics = torch.tensor([val_loss, psnr, ssim], device=device)
+            dist.all_reduce(metrics, op=dist.ReduceOp.AVG)
+            val_loss, psnr, ssim = metrics.tolist()
 
         if is_main:
             wandb.log({
                 "epoch/train_loss": avg_train_loss,
                 "epoch/val_loss":   val_loss,
+                "epoch/psnr":       psnr,
+                "epoch/ssim":       ssim,
                 "epoch":            epoch + 1,
             }, step=global_step)
             print(f"Epoch {epoch+1} | train={avg_train_loss:.4f} val={val_loss:.4f} "
-                  f"| {(time.time()-t0)/3600:.2f}h elapsed")
+                  f"PSNR={psnr:.2f} SSIM={ssim:.4f} | {(time.time()-t0)/3600:.2f}h elapsed")
 
             ckpt_path = str(save_dir / f"ckpt_epoch_{epoch+1:03d}.pt")
             save_checkpoint(ckpt_path, raw_model, optimizer, scheduler,

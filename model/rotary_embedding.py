@@ -131,7 +131,7 @@ class RotaryEmbedding(Module):
         self.cache_max_seq_len = cache_max_seq_len
 
         self.register_buffer("cached_freqs", torch.zeros(cache_max_seq_len, dim), persistent=False)
-        self.register_buffer("cached_freqs_seq_len", torch.tensor(0), persistent=False)
+        self.cached_freqs_seq_len = 0
 
         self.learned_freq = learned_freq
 
@@ -289,7 +289,7 @@ class RotaryEmbedding(Module):
     def forward(self, t: Tensor, freqs: Tensor, seq_len=None, offset=0):
         should_cache = self.cache_if_possible and not self.learned_freq and exists(seq_len) and self.freqs_for != "pixel" and (offset + seq_len) <= self.cache_max_seq_len
 
-        if should_cache and exists(self.cached_freqs) and (offset + seq_len) <= self.cached_freqs_seq_len.item():
+        if should_cache and exists(self.cached_freqs) and (offset + seq_len) <= self.cached_freqs_seq_len:
             return self.cached_freqs[offset : (offset + seq_len)].detach()
 
         freqs = einsum("..., f -> ... f", t.type(freqs.dtype), freqs)
@@ -297,6 +297,6 @@ class RotaryEmbedding(Module):
 
         if should_cache and offset == 0:
             self.cached_freqs[:seq_len] = freqs.detach()
-            self.cached_freqs_seq_len.copy_(seq_len)
+            self.cached_freqs_seq_len = seq_len
 
         return freqs
