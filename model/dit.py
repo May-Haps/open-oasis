@@ -222,7 +222,8 @@ class DiT(nn.Module):
 
         self.spatial_rotary_emb = RotaryEmbedding(dim=hidden_size // num_heads // 2, freqs_for="pixel", max_freq=256)
         self.temporal_rotary_emb = RotaryEmbedding(dim=hidden_size // num_heads)
-        self.external_cond = nn.Linear(external_cond_dim, hidden_size) if external_cond_dim > 0 else nn.Identity()
+        self.external_cond = (nn.Sequential(nn.Linear(external_cond_dim, hidden_size),nn.Dropout(p=0.1),) if external_cond_dim > 0 else nn.Identity())
+
 
         self.external_cond_dim = external_cond_dim
 
