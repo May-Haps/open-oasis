@@ -353,3 +353,23 @@ def CoinRunWorldModel():
         external_cond_dim=15,
         max_frames=32,
     )
+
+
+def CoinRunWorldModelSmall():
+    """
+    Pixel-space DiT for 64×64 CoinRun frames. ~60M params.
+    Same architecture as CoinRunWorldModel but hidden=512, depth=6.
+    Trains ~1.5-2× faster; sufficient capacity for CoinRun's simple visual vocabulary.
+    Targets ~5 epochs over 50M frames in 12h on a single H100 SXM.
+    """
+    return DiT(
+        input_h=64,
+        input_w=64,
+        patch_size=8,
+        in_channels=3,
+        hidden_size=512,
+        depth=6,
+        num_heads=8,
+        external_cond_dim=15,
+        max_frames=32,
+    )

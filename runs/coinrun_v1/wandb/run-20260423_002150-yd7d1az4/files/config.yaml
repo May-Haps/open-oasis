@@ -1,0 +1,153 @@
+_wandb:
+    value:
+        cli_version: 0.26.0
+        e:
+            psjr7lmsugfjo3dpaaow5aey4qjc2qsj:
+                codePath: train_coinrun.py
+                codePathLocal: train_coinrun.py
+                cpu_count: 40
+                cpu_count_logical: 40
+                cudaVersion: "12.6"
+                disk:
+                    /:
+                        total: "315926315008"
+                        used: "32156545024"
+                email: jyangftw@gmail.com
+                executable: /ocean/projects/cis250234p/jyang45/conda/envs/open-oasis/bin/python
+                git:
+                    commit: ad9efa22a762fd619e7cb02ff9b3cb80169e23bc
+                    remote: https://github.com/May-Haps/open-oasis.git
+                gpu: Tesla V100-SXM2-32GB
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Volta
+                      cudaCores: 5120
+                      memoryTotal: "34359738368"
+                      name: Tesla V100-SXM2-32GB
+                      uuid: GPU-9c9d6f32-3a27-5919-2132-b74f777e7d8b
+                host: v024.ib.bridges2.psc.edu
+                memory:
+                    total: "540673662976"
+                os: Linux-4.18.0-553.22.1.el8_10.x86_64-x86_64-with-glibc2.28
+                program: /ocean/projects/cis250234p/jyang45/open-oasis/train_coinrun.py
+                python: CPython 3.11.15
+                root: runs/coinrun_v1
+                slurm:
+                    cluster_name: bridges2
+                    conf: /var/spool/slurm/d/conf-cache/slurm.conf
+                    cpus_on_node: "5"
+                    export_env: ALL
+                    gpus_on_node: "1"
+                    gtids: "0"
+                    job_account: cis250234p
+                    job_cpus_per_node: "5"
+                    job_cpus_per_node_pack_group_0: "5"
+                    job_gid: "27329"
+                    job_gpus: "3"
+                    job_id: "40191068"
+                    job_name: Interact
+                    job_nodelist: v024
+                    job_num_nodes: "1"
+                    job_partition: GPU-shared
+                    job_qos: gpuinteract
+                    job_uid: "100178"
+                    job_user: jyang45
+                    jobid: "40191068"
+                    launch_node_ipaddr: 10.8.11.31
+                    localid: "0"
+                    mpi_type: none
+                    nnodes: "1"
+                    node_aliases: (null)
+                    nodeid: "0"
+                    nodelist: v024
+                    prio_process: "0"
+                    procid: "0"
+                    pty_port: "45691"
+                    pty_win_col: "138"
+                    pty_win_row: "63"
+                    script_context: prolog_task
+                    srun_comm_host: 10.8.11.31
+                    srun_comm_port: "34665"
+                    step_id: "4294967290"
+                    step_launcher_port: "34665"
+                    step_nodelist: v024
+                    step_num_nodes: "1"
+                    step_num_tasks: "1"
+                    step_tasks_per_node: "1"
+                    stepid: "4294967290"
+                    submit_dir: /jet/home/jyang45
+                    submit_host: br013.ib.bridges2.psc.edu
+                    task_pid: "28292"
+                    tasks_per_node: "5"
+                    topology_addr: v024
+                    topology_addr_pattern: node
+                    working_cluster: bridges2:br003:6810:9728:109
+                startedAt: "2026-04-23T04:21:50.807267Z"
+                writerId: psjr7lmsugfjo3dpaaow5aey4qjc2qsj
+        m: []
+        python_version: 3.11.15
+        t:
+            "1":
+                - 1
+                - 41
+                - 49
+                - 63
+            "2":
+                - 1
+                - 41
+                - 49
+                - 63
+            "3":
+                - 14
+                - 16
+                - 61
+            "4": 3.11.15
+            "5": 0.26.0
+            "8":
+                - 2
+            "12": 0.26.0
+            "13": linux-x86_64
+batch_size:
+    value: 8
+ckpt_every_steps:
+    value: 2000
+clip_len:
+    value: 32
+clip_stride:
+    value: 8
+ddim_steps:
+    value: 10
+epochs:
+    value: 10
+grad_clip:
+    value: 1
+log_every_steps:
+    value: 50
+lr:
+    value: 0.0001
+max_noise_level:
+    value: 1000
+n_prompt_frames:
+    value: 1
+n_rollout_samples:
+    value: 4
+rollout_every_steps:
+    value: 5000
+rollout_frames:
+    value: 16
+save_dir:
+    value: runs/coinrun_v1
+train_dir:
+    value: data/coinrun/train
+val_dir:
+    value: data/coinrun/val
+val_every_epoch:
+    value: true
+wandb_entity:
+    value: spring26-gen-ai
+wandb_project:
+    value: coinrun-world-model
+warmup_steps:
+    value: 2000
+weight_decay:
+    value: 0.01

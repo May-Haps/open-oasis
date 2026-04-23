@@ -25,15 +25,18 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import wandb
+from tqdm import tqdm
 from einops import rearrange
 from torch import autocast
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torchvision.utils import make_grid
 
-from data.dataset_coinrun import CoinRunDataset
-from model.dit import CoinRunWorldModel
+from data.dataset_coinrun_streaming import CoinRunStreamingDataset
+from model.dit import CoinRunWorldModel, CoinRunWorldModelSmall
 from model.utils import sigmoid_beta_schedule
 from training.noise_scheduler import NoiseScheduler
 
@@ -42,8 +45,8 @@ from training.noise_scheduler import NoiseScheduler
 # ---------------------------------------------------------------------------
 CONFIG = {
     # Paths
-    "train_dir":  "data/coinrun_processed/train",
-    "val_dir":    "data/coinrun_processed/val",
+    "train_dir":  "data/coinrun/train",
+    "val_dir":    "data/coinrun/val",
     "save_dir":   "runs/coinrun_v1",
 
     # Model
@@ -55,7 +58,7 @@ CONFIG = {
 
     # Training
     "epochs":          10,       # stop early if time budget hit; checkpoints preserve progress
-    "batch_size":      256,
+    "batch_size":      8,
     "lr":              1e-4,
     "weight_decay":    0.01,
     "warmup_steps":    2000,
@@ -75,7 +78,7 @@ CONFIG = {
 
     # WandB
     "wandb_project": "coinrun-world-model",
-    "wandb_entity":  None,         # set to your wandb username/org or leave None
+    "wandb_entity":  "spring26-gen-ai",
 }
 
 
@@ -262,31 +265,48 @@ def val_epoch(
 # Main
 # ---------------------------------------------------------------------------
 def main(args):
-    device = "cuda"
+    # --- DDP setup ---
+    is_ddp = "LOCAL_RANK" in os.environ
+    if is_ddp:
+        dist.init_process_group("nccl")
+        local_rank = int(os.environ["LOCAL_RANK"])
+        world_size = dist.get_world_size()
+        device = f"cuda:{local_rank}"
+        torch.cuda.set_device(local_rank)
+        is_main = local_rank == 0
+    else:
+        local_rank = 0
+        world_size = 1
+        device = "cuda"
+        is_main = True
+
     assert torch.cuda.is_available(), "CUDA required"
 
     save_dir = Path(CONFIG["save_dir"])
-    save_dir.mkdir(parents=True, exist_ok=True)
+    if is_main:
+        save_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- WandB ---
-    run = wandb.init(
-        project=CONFIG["wandb_project"],
-        entity=CONFIG["wandb_entity"],
-        config=CONFIG,
-        resume="allow",
-        id=wandb.util.generate_id() if not args.resume else None,
-        dir=str(save_dir),
-    )
-    (save_dir / "wandb_run_id.txt").write_text(run.id)
+    # --- WandB (rank 0 only) ---
+    if is_main:
+        run = wandb.init(
+            project=CONFIG["wandb_project"],
+            entity=CONFIG["wandb_entity"],
+            config=CONFIG,
+            resume="allow",
+            id=wandb.util.generate_id() if not args.resume else None,
+            dir=str(save_dir),
+        )
+        (save_dir / "wandb_run_id.txt").write_text(run.id)
 
     # --- Model ---
-    model = CoinRunWorldModel().to(device)
-    model = torch.compile(model)   # ~10-20% speedup on H100
-    print(f"Parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M")
+    raw_model = CoinRunWorldModelSmall().to(device)
+    if is_main:
+        print(f"Parameters: {sum(p.numel() for p in raw_model.parameters()) / 1e6:.1f}M")
+    model = DDP(raw_model, device_ids=[local_rank]) if is_ddp else raw_model
 
     # --- Optimiser ---
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        raw_model.parameters(),
         lr=CONFIG["lr"],
         weight_decay=CONFIG["weight_decay"],
     )
@@ -302,37 +322,41 @@ def main(args):
     alphas_cumprod = rearrange(torch.cumprod(1.0 - betas, dim=0), "T -> T 1 1 1")
 
     # --- Data ---
-    train_ds = CoinRunDataset(CONFIG["train_dir"], CONFIG["clip_len"], CONFIG["clip_stride"])
-    val_ds   = CoinRunDataset(CONFIG["val_dir"],   CONFIG["clip_len"], CONFIG["clip_stride"])
+    train_ds = CoinRunStreamingDataset(CONFIG["train_dir"], CONFIG["clip_len"], CONFIG["clip_stride"])
+    val_ds   = CoinRunStreamingDataset(CONFIG["val_dir"],   CONFIG["clip_len"], CONFIG["clip_stride"], seed=0)
 
-    train_loader = DataLoader(
-        train_ds, batch_size=CONFIG["batch_size"], shuffle=True,
-        num_workers=8, pin_memory=True, persistent_workers=True,
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=CONFIG["batch_size"] // 4, shuffle=False,
-        num_workers=4, pin_memory=True, persistent_workers=True,
-    )
+    train_loader = DataLoader(train_ds, batch_size=CONFIG["batch_size"],
+                              num_workers=4, multiprocessing_context="spawn")
+    val_loader   = DataLoader(val_ds,   batch_size=CONFIG["batch_size"] // 4,
+                              num_workers=2, multiprocessing_context="spawn")
 
-    # Fixed val prompts for visual logging (same clips every time)
-    val_samples = [val_ds[i * (len(val_ds) // CONFIG["n_rollout_samples"])]
-                   for i in range(CONFIG["n_rollout_samples"])]
-    prompt_frames = torch.stack([s["frames"][:CONFIG["n_prompt_frames"]] for s in val_samples])
-    prompt_actions = torch.stack([s["actions"][:CONFIG["rollout_frames"]] for s in val_samples])
-    gt_frames = torch.stack([s["frames"][:CONFIG["rollout_frames"]] for s in val_samples])
-    gt_uint8 = (rearrange(gt_frames, "b t c h w -> b t h w c") * 255).byte()
+    # Fixed val prompts for visual logging (rank 0 only)
+    if is_main:
+        val_samples = []
+        for item in val_ds:
+            val_samples.append(item)
+            if len(val_samples) >= CONFIG["n_rollout_samples"]:
+                break
+        prompt_frames  = torch.stack([s["frames"][:CONFIG["n_prompt_frames"]] for s in val_samples])
+        prompt_actions = torch.stack([s["actions"][:CONFIG["rollout_frames"]]  for s in val_samples])
+        gt_frames      = torch.stack([s["frames"][:CONFIG["rollout_frames"]]   for s in val_samples])
+        gt_uint8 = (rearrange(gt_frames, "b t c h w -> b t h w c") * 255).byte()
 
     # --- Resume ---
     start_epoch, global_step, best_val = 0, 0, float("inf")
     if args.resume:
         start_epoch, global_step, best_val = load_checkpoint(
-            args.resume, model, optimizer, scheduler
+            args.resume, raw_model, optimizer, scheduler
         )
         best_val = best_val or float("inf")
-        print(f"Resumed from {args.resume} (epoch={start_epoch}, step={global_step})")
+        if is_main:
+            print(f"Resumed from {args.resume} (epoch={start_epoch}, step={global_step})")
 
-    # Save config
-    (save_dir / "config.json").write_text(json.dumps(CONFIG, indent=2))
+    if is_main:
+        (save_dir / "config.json").write_text(json.dumps(CONFIG, indent=2))
+
+    if is_ddp:
+        dist.barrier()
 
     # --- Training loop ---
     model.train()
@@ -341,7 +365,10 @@ def main(args):
     for epoch in range(start_epoch, CONFIG["epochs"]):
         epoch_loss, epoch_steps = 0.0, 0
 
-        for batch in train_loader:
+        total_batches = len(train_ds) // (CONFIG["batch_size"] * world_size)
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}", total=total_batches,
+                    dynamic_ncols=True, disable=not is_main)
+        for batch in pbar:
             loss = train_step(
                 model, batch, noise_scheduler,
                 optimizer, scheduler, device, CONFIG["grad_clip"],
@@ -349,75 +376,81 @@ def main(args):
             global_step  += 1
             epoch_loss   += loss
             epoch_steps  += 1
+            pbar.set_postfix(loss=f"{loss:.4f}", step=global_step)
 
-            # --- Loss log ---
-            if global_step % CONFIG["log_every_steps"] == 0:
-                elapsed = (time.time() - t0) / 3600
-                wandb.log({
-                    "train/loss": loss,
-                    "train/lr":   scheduler.get_last_lr()[0],
-                    "perf/elapsed_hours": elapsed,
-                    "perf/steps_per_sec": global_step / (time.time() - t0),
-                }, step=global_step)
-
-            # --- Checkpoint ---
-            if global_step % CONFIG["ckpt_every_steps"] == 0:
-                ckpt_path = str(save_dir / f"ckpt_step_{global_step:07d}.pt")
-                save_checkpoint(ckpt_path, model, optimizer, scheduler,
-                                epoch, global_step, None, CONFIG)
-                wandb.save(ckpt_path, base_path=str(save_dir))
-                print(f"[step {global_step}] checkpoint saved")
-
-            # --- Rollout visual log ---
-            if global_step % CONFIG["rollout_every_steps"] == 0:
-                generated = generate_rollout(
-                    model, prompt_frames, prompt_actions,
-                    alphas_cumprod, device,
-                    ddim_steps=CONFIG["ddim_steps"],
-                    total_frames=CONFIG["rollout_frames"],
-                    n_prompt=CONFIG["n_prompt_frames"],
-                )
-                # Log as video (wandb.Video expects [T, C, H, W] or [T, H, W, C])
-                for i in range(CONFIG["n_rollout_samples"]):
+            if is_main:
+                # --- Loss log ---
+                if global_step % CONFIG["log_every_steps"] == 0:
+                    elapsed = (time.time() - t0) / 3600
                     wandb.log({
-                        f"rollout/video_{i}": wandb.Video(
-                            generated[i].numpy(), fps=15, format="mp4"
-                        ),
+                        "train/loss": loss,
+                        "train/lr":   scheduler.get_last_lr()[0],
+                        "perf/elapsed_hours": elapsed,
+                        "perf/steps_per_sec": global_step / (time.time() - t0),
                     }, step=global_step)
 
-                # Log comparison grid (GT top, generated bottom)
-                grid = frames_to_grid(generated, gt_uint8)
-                wandb.log({"rollout/grid": wandb.Image(grid)}, step=global_step)
+                # --- Checkpoint ---
+                if global_step % CONFIG["ckpt_every_steps"] == 0:
+                    ckpt_path = str(save_dir / f"ckpt_step_{global_step:07d}.pt")
+                    save_checkpoint(ckpt_path, raw_model, optimizer, scheduler,
+                                    epoch, global_step, None, CONFIG)
+                    wandb.save(ckpt_path, base_path=str(save_dir))
+                    print(f"[step {global_step}] checkpoint saved")
+
+                # --- Rollout visual log ---
+                if global_step % CONFIG["rollout_every_steps"] == 0:
+                    generated = generate_rollout(
+                        raw_model, prompt_frames, prompt_actions,
+                        alphas_cumprod, device,
+                        ddim_steps=CONFIG["ddim_steps"],
+                        total_frames=CONFIG["rollout_frames"],
+                        n_prompt=CONFIG["n_prompt_frames"],
+                    )
+                    for i in range(CONFIG["n_rollout_samples"]):
+                        wandb.log({
+                            f"rollout/video_{i}": wandb.Video(
+                                generated[i].numpy(), fps=15, format="mp4"
+                            ),
+                        }, step=global_step)
+                    grid = frames_to_grid(generated, gt_uint8)
+                    wandb.log({"rollout/grid": wandb.Image(grid)}, step=global_step)
 
         # --- End of epoch ---
         avg_train_loss = epoch_loss / max(epoch_steps, 1)
         val_loss = val_epoch(model, val_loader, noise_scheduler, device)
 
-        wandb.log({
-            "epoch/train_loss": avg_train_loss,
-            "epoch/val_loss":   val_loss,
-            "epoch":            epoch + 1,
-        }, step=global_step)
+        # aggregate val loss across ranks
+        if is_ddp:
+            val_tensor = torch.tensor(val_loss, device=device)
+            dist.all_reduce(val_tensor, op=dist.ReduceOp.AVG)
+            val_loss = val_tensor.item()
 
-        print(f"Epoch {epoch+1} | train={avg_train_loss:.4f} val={val_loss:.4f} "
-              f"| {(time.time()-t0)/3600:.2f}h elapsed")
+        if is_main:
+            wandb.log({
+                "epoch/train_loss": avg_train_loss,
+                "epoch/val_loss":   val_loss,
+                "epoch":            epoch + 1,
+            }, step=global_step)
+            print(f"Epoch {epoch+1} | train={avg_train_loss:.4f} val={val_loss:.4f} "
+                  f"| {(time.time()-t0)/3600:.2f}h elapsed")
 
-        # Save epoch checkpoint
-        ckpt_path = str(save_dir / f"ckpt_epoch_{epoch+1:03d}.pt")
-        save_checkpoint(ckpt_path, model, optimizer, scheduler,
-                        epoch + 1, global_step, val_loss, CONFIG)
-        wandb.save(ckpt_path, base_path=str(save_dir))
-
-        # Save best
-        if val_loss < best_val:
-            best_val = val_loss
-            best_path = str(save_dir / "ckpt_best.pt")
-            save_checkpoint(best_path, model, optimizer, scheduler,
+            ckpt_path = str(save_dir / f"ckpt_epoch_{epoch+1:03d}.pt")
+            save_checkpoint(ckpt_path, raw_model, optimizer, scheduler,
                             epoch + 1, global_step, val_loss, CONFIG)
-            wandb.save(best_path, base_path=str(save_dir))
-            print(f"  ↳ new best val loss: {best_val:.4f}")
+            wandb.save(ckpt_path, base_path=str(save_dir))
 
-    wandb.finish()
+            if val_loss < best_val:
+                best_val = val_loss
+                best_path = str(save_dir / "ckpt_best.pt")
+                save_checkpoint(best_path, raw_model, optimizer, scheduler,
+                                epoch + 1, global_step, val_loss, CONFIG)
+                wandb.save(best_path, base_path=str(save_dir))
+                print(f"  ↳ new best val loss: {best_val:.4f}")
+
+    if is_main:
+        wandb.finish()
+    if is_ddp:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 #Custom
 *.vscode
+data/coinrun/*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
