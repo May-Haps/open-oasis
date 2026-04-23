@@ -8,9 +8,9 @@ References:
 from typing import Optional, Literal
 import torch
 from torch import nn
-from dit.rotary_embedding_torch import RotaryEmbedding
+from model_comps.rotary_embedding_torch import RotaryEmbedding
 from einops import rearrange
-from dit.attention import SpatialAxialAttention, TemporalAxialAttention
+from model_comps.attention import SpatialAxialAttention, TemporalAxialAttention
 from timm.models.vision_transformer import Mlp
 from timm.layers.helpers import to_2tuple
 import math
@@ -207,7 +207,7 @@ class DiT(nn.Module):
         depth=12,
         num_heads=16,
         mlp_ratio=4.0,
-        external_cond_dim=25,
+        external_cond_dim=8,
         max_frames=32,
     ):
         super().__init__()

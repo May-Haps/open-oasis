@@ -7,10 +7,10 @@ from einops import rearrange
 from torch import autocast
 from torchvision.io import write_video
 
-from dit.dit import DiT
-from dit.vae import AutoencoderKL
-from dataset import MinecraftLatentDataset
-from dit.utils import sigmoid_beta_schedule
+from model_comps.dit import DiT
+from model_comps.vae import AutoencoderKL
+from common.mario_dit_dataset import ProcessedGameDataset
+from model_comps.utils import sigmoid_beta_schedule
 
 
 class RolloutSampler:
@@ -23,7 +23,7 @@ class RolloutSampler:
         self,
         dit: DiT,
         vae: AutoencoderKL,
-        val_dataset: MinecraftLatentDataset,
+        val_dataset: ProcessedGameDataset,
         device: str,
         num_samples: int = 2,
         num_frames: int = 16,

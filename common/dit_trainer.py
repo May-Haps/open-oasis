@@ -1,10 +1,10 @@
-from typing import cast
+from typing import cast, Literal
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from dit.dit import DiT
+from model_comps.dit import DiT
 from common.noise_scheduler import NoiseScheduler
 
 class ModelTrainer():
@@ -17,7 +17,7 @@ class ModelTrainer():
             weight_decay:float = 0.01,
             warmup_steps: int = 1000,
             grad_clip_max_norm: float = 1.0,
-            trainable_components: list[str] = ['action_routing', 'external_cond', 'adaLN_modulation'],
+            trainable_components: list[str] | Literal['all'] = ['action_routing', 'external_cond', 'adaLN_modulation'],
             debug: bool = False
     ) -> None:
         self.dit = dit
@@ -32,7 +32,10 @@ class ModelTrainer():
         self.noise_scheduler = NoiseScheduler(max_noise_level, device)
         self.loss_fn = nn.MSELoss()
         
-        self.freeze_model_components(trainable_components, debug)
+        if trainable_components != 'all':
+            self.freeze_model_components(trainable_components, debug)
+        else:
+            print('trainable_components was none sp training all components')
 
         # NOTE Need to freeze specific parameters also maybe should do parameters groups
         self.optimizer = torch.optim.AdamW(self.dit.parameters(), lr=lr, weight_decay=weight_decay)

@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 
-from dit.dit import DiT, gate, modulate, SpatioTemporalDiTBlock
+from model_comps.dit import DiT, gate, modulate, SpatioTemporalDiTBlock
 
 class ActionGatedDiTBlock(SpatioTemporalDiTBlock):
     def __init__(self, *args, **kwargs):

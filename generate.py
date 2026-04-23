@@ -4,10 +4,10 @@ References:
 """
 
 import torch
-from dit.dit import DiT_models
-from dit.vae import VAE_models
+from model_comps.dit import DiT_models
+from model_comps.vae import VAE_models
 from torchvision.io import read_video, write_video
-from dit.utils import load_prompt, load_actions, sigmoid_beta_schedule
+from model_comps.utils import load_prompt, load_actions, sigmoid_beta_schedule
 from tqdm import tqdm
 from einops import rearrange
 from torch import autocast

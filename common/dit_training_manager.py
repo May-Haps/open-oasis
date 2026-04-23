@@ -1,4 +1,4 @@
-from typing import Any, cast, TypedDict
+from typing import Any, cast, Literal, TypedDict
 import json
 import os
 
@@ -6,11 +6,11 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from dit.dit import DiT
-from dataset import MinecraftLatentDataset
-from common.model_trainer import ModelTrainer
+from model_comps.dit import DiT
+from common.mario_dit_dataset import ProcessedGameDataset
+from common.dit_trainer import ModelTrainer
 from common.rollout_sampler import RolloutSampler
-from dit.vae import AutoencoderKL
+from model_comps.vae import AutoencoderKL
 
 class ModelTrainingConfig(TypedDict):
     max_noise_level: int
@@ -22,7 +22,7 @@ class ModelTrainingConfig(TypedDict):
     weight_decay: float
     warmup_steps: int
     grad_clip_max_norm: float
-    trainable_components: list[str]
+    trainable_components: list[str] | Literal['all']
     save_dir: str | None
 
 # TODO
@@ -101,7 +101,7 @@ class TrainingManager():
             rollout_sampler = RolloutSampler(
                 dit=self.dit,
                 vae=self.vae,
-                val_dataset=cast(MinecraftLatentDataset, val_loader.dataset),
+                val_dataset=cast(ProcessedGameDataset, val_loader.dataset),
                 device=self.device,
                 num_samples=TrainingManager._N_ROLLOUT_SAMPLES,
                 num_frames=TrainingManager._N_ROLLOUT_FRAMES,
@@ -118,6 +118,7 @@ class TrainingManager():
             weight_decay=config['weight_decay'],
             warmup_steps=config['warmup_steps'],
             grad_clip_max_norm=config['grad_clip_max_norm'],
+            trainable_components=config['trainable_components'],
             debug=self.debug
         )
 
@@ -128,8 +129,8 @@ class TrainingManager():
     def _run_training(
             self,
             trainer: ModelTrainer,
-            train_loader: DataLoader[MinecraftLatentDataset],
-            val_loader: DataLoader[MinecraftLatentDataset],
+            train_loader: DataLoader[ProcessedGameDataset],
+            val_loader: DataLoader[ProcessedGameDataset],
             rollout_sampler: RolloutSampler | None,
             config: ModelTrainingConfig
     ) -> ModelTrainingResults:
@@ -180,7 +181,7 @@ class TrainingManager():
 
     def _compute_evaluation_metrics(
             self,
-            val_loader: DataLoader[MinecraftLatentDataset],
+            val_loader: DataLoader[ProcessedGameDataset],
             rollout_sampler: RolloutSampler | None,
             epoch: int,
             save_dir: str | None
@@ -199,8 +200,8 @@ class TrainingManager():
             clip_len: int,
             clip_stride: int,
             shuffle: bool
-    ) -> DataLoader[MinecraftLatentDataset]:
-        dataset = MinecraftLatentDataset(data_folder_path, clip_len, clip_stride)
+    ) -> DataLoader[ProcessedGameDataset]:
+        dataset = ProcessedGameDataset(data_folder_path, clip_len, clip_stride)
         dataset_loader = DataLoader(
             dataset,
             batch_size,

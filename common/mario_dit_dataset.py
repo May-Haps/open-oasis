@@ -8,10 +8,10 @@ import zipfile
 import torch
 from torch.utils.data import Dataset
 
-ACTION_DIM = 25
+ACTION_DIM = 8
 
 
-class MinecraftLatentDataset(Dataset):
+class ProcessedGameDataset(Dataset):
     def __init__(
         self,
         processed_dir: str | Path,
@@ -54,12 +54,12 @@ class MinecraftLatentDataset(Dataset):
                         episode_id = episode["episode_id"]
                         existing = episodes_by_id.get(episode_id, {})
                         episodes_by_id[episode_id] = {**existing, **episode}
-                    elif member_name.endswith("/latents.pt"):
+                    elif member_name.endswith("/frames.pt"):
                         episode_id = Path(member_name).parent.name
                         episode = episodes_by_id.setdefault(episode_id, {"episode_id": episode_id})
-                        episode["latents_zip_path"] = str(zip_path)
-                        episode["latents_zip_member"] = member_name
-                    elif member_name.endswith("/actions.one_hot.pt"):
+                        episode["frames_zip_path"] = str(zip_path)
+                        episode["frames_zip_member"] = member_name
+                    elif member_name.endswith("/actions.pt"):
                         episode_id = Path(member_name).parent.name
                         episode = episodes_by_id.setdefault(episode_id, {"episode_id": episode_id})
                         episode["actions_zip_path"] = str(zip_path)
@@ -86,10 +86,25 @@ class MinecraftLatentDataset(Dataset):
     def __len__(self) -> int:
         return len(self.index)
 
+    def _resolve_data_path(self, raw_path: str | None) -> Path | None:
+        if raw_path is None:
+            return None
+        path = Path(raw_path)
+        if path.exists():
+            return path
+        candidate = self.processed_dir / path
+        if candidate.exists():
+            return candidate
+        return None
+
+    def _unpack_nes_action(self, action_int: int):
+        # Standard NES order: A, B, Select, Start, Up, Down, Left, Right
+        return torch.tensor([(action_int >> i) & 1 for i in range(8)], dtype=torch.float32)
+
     def _load_tensor(self, episode: dict, path_key: str, zip_path_key: str, zip_member_key: str) -> torch.Tensor:
-        direct_path = episode.get(path_key)
-        if direct_path and Path(direct_path).exists():
-            return torch.load(direct_path, weights_only=True).float()
+        direct_path = self._resolve_data_path(episode.get(path_key))
+        if direct_path is not None:
+            return torch.load(direct_path, weights_only=True)
 
         zip_path = episode.get(zip_path_key)
         zip_member = episode.get(zip_member_key)
@@ -97,7 +112,7 @@ class MinecraftLatentDataset(Dataset):
             with zipfile.ZipFile(zip_path) as archive:
                 with archive.open(zip_member) as handle:
                     buffer = io.BytesIO(handle.read())
-            return torch.load(buffer, weights_only=True).float()
+            return torch.load(buffer, weights_only=True)
 
         raise FileNotFoundError(
             f"Could not find tensor for episode={episode['episode_id']} "
@@ -108,19 +123,26 @@ class MinecraftLatentDataset(Dataset):
         episode_idx, start = self.index[idx]
         episode = self.episodes[episode_idx]
 
-        latents = self._load_tensor(episode, "latents_path", "latents_zip_path", "latents_zip_member")
-        actions = self._load_tensor(episode, "processed_actions_path", "actions_zip_path", "actions_zip_member")
+        frames = self._load_tensor(episode, "frames_path", "frames_zip_path", "frames_zip_member")
+        raw_actions = self._load_tensor(episode, "actions_path", "actions_zip_path", "actions_zip_member").float()
 
-        latents_clip = latents[start : start + self.clip_len]
-        transition_actions = actions[start : start + self.clip_len - 1]
+        frames_clip = frames[start : start + self.clip_len].float() / 255.0
 
-        # Match Oasis inference behavior: the first frame in the clip is a prompt frame.
-        clip_actions = torch.zeros(self.clip_len, ACTION_DIM, dtype=actions.dtype)
-        clip_actions[1:] = transition_actions
+        transition_actions_ints = raw_actions[start : start + self.clip_len - 1]
+        transition_actions_bits = torch.stack([
+            self._unpack_nes_action(int(a)) for a in transition_actions_ints
+        ])
+
+        clip_actions = torch.zeros(self.clip_len, ACTION_DIM, dtype=torch.float32)
+        clip_actions[1:] = transition_actions_bits
 
         return {
-            "latents": latents_clip,
+            "frames": frames_clip,
             "actions": clip_actions,
             "episode_id": episode["episode_id"],
             "start": start,
         }
+
+
+# Backward-compatible alias for older training code that imported the old name.
+MinecraftLatentDataset = ProcessedGameDataset

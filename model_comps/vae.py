@@ -14,8 +14,8 @@ import torch.nn.functional as F
 from einops import rearrange
 from timm.models.vision_transformer import Mlp
 from timm.layers.helpers import to_2tuple
-from dit.rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
-from dit.dit import PatchEmbed
+from model_comps.rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
+from model_comps.dit import PatchEmbed
 
 
 class DiagonalGaussianDistribution(object):
@@ -333,6 +333,21 @@ class AutoencoderKL(nn.Module):
     def get_last_layer(self):
         return self.predictor.weight
 
+def prepare_latents(vae, pixel_clip, scaling_factor=0.18215, training=True):
+    """Standardized latent preparation with scaling."""
+    B, T, C, H, W = pixel_clip.shape
+    x = rearrange(pixel_clip, "b t c h w -> (b t) c h w")
+    posterior = vae.encode(x)
+    z = posterior.sample() if training else posterior.mode()
+    z = rearrange(z, "(b t) (h w) c -> b t c h w", b=B, t=T, h=vae.seq_h, w=vae.seq_w)
+    return z * scaling_factor
+
+def decode_latents(vae, latent_clip, scaling_factor=0.18215):
+    """Standardized decoding."""
+    B, T, C, H, W = latent_clip.shape
+    z = rearrange(latent_clip / scaling_factor, "b t c h w -> (b t) (h w) c")
+    pixels = vae.decode(z)
+    return rearrange(pixels, "(b t) c h w -> b t c h w", b=B, t=T)
 
 def ViT_L_20_Shallow_Encoder(**kwargs):
     if "latent_dim" in kwargs:
