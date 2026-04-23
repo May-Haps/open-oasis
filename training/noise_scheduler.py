@@ -1,5 +1,5 @@
 import torch
-from dit.utils import sigmoid_beta_schedule
+from model.utils import sigmoid_beta_schedule
 
 class NoiseScheduler:
     def __init__(self, timesteps: int, device: str) -> None:

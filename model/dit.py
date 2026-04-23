@@ -5,12 +5,12 @@ References:
     - Latte: https://github.com/Vchitect/Latte/blob/main/models/latte.py
 """
 
-from typing import Optional, Literal
+from typing import Literal
 import torch
 from torch import nn
-from dit.rotary_embedding_torch import RotaryEmbedding
+from model.rotary_embedding import RotaryEmbedding
 from einops import rearrange
-from dit.attention import SpatialAxialAttention, TemporalAxialAttention
+from model.attention import SpatialAxialAttention, TemporalAxialAttention
 from timm.models.vision_transformer import Mlp
 from timm.layers.helpers import to_2tuple
 import math
@@ -133,15 +133,14 @@ class SpatioTemporalDiTBlock(nn.Module):
         self,
         hidden_size,
         num_heads,
-        mlp_ratio=4.0,
-        is_causal=True,
-        spatial_rotary_emb: Optional[RotaryEmbedding] = None,
-        temporal_rotary_emb: Optional[RotaryEmbedding] = None,
+        spatial_rotary_emb: RotaryEmbedding,
+        temporal_rotary_emb: RotaryEmbedding,
+        mlp_ratio: float = 4.0,
+        is_causal: bool = True,
     ):
         super().__init__()
         self.is_causal = is_causal
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        approx_gelu = lambda: nn.GELU(approximate="tanh")
 
         self.s_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.s_attn = SpatialAxialAttention(
@@ -154,7 +153,7 @@ class SpatioTemporalDiTBlock(nn.Module):
         self.s_mlp = Mlp(
             in_features=hidden_size,
             hidden_features=mlp_hidden_dim,
-            act_layer=approx_gelu,
+            act_layer=lambda: nn.GELU(approximate="tanh"),
             drop=0,
         )
         self.s_adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size, bias=True))
@@ -171,7 +170,7 @@ class SpatioTemporalDiTBlock(nn.Module):
         self.t_mlp = Mlp(
             in_features=hidden_size,
             hidden_features=mlp_hidden_dim,
-            act_layer=approx_gelu,
+            act_layer=lambda: nn.GELU(approximate="tanh"),
             drop=0,
         )
         self.t_adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size, bias=True))
@@ -322,13 +321,35 @@ class DiT(nn.Module):
         return x
 
 
-def DiT_S_2():
+def MarioWorldModel():
+    """Pixel-space DiT for 64×64 Mario frames. ~15M params."""
     return DiT(
-        patch_size=2,
-        hidden_size=1024,
-        depth=16,
-        num_heads=16,
+        input_h=64,
+        input_w=64,
+        patch_size=8,
+        in_channels=3,
+        hidden_size=256,
+        depth=6,
+        num_heads=4,
+        external_cond_dim=8,
+        max_frames=32,
     )
 
 
-DiT_models = {"DiT-S/2": DiT_S_2}
+def CoinRunWorldModel():
+    """
+    Pixel-space DiT for 64×64 CoinRun frames. ~100M params.
+    15 discrete Procgen actions (one-hot).
+    Targets ~2 epochs over 50M frames in 8h on a single H100 SXM.
+    """
+    return DiT(
+        input_h=64,
+        input_w=64,
+        patch_size=8,
+        in_channels=3,
+        hidden_size=640,
+        depth=8,
+        num_heads=8,
+        external_cond_dim=15,
+        max_frames=32,
+    )

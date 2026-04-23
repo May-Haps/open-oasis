@@ -4,8 +4,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from dit.dit import DiT
-from common.noise_scheduler import NoiseScheduler
+from model.dit import DiT
+from training.noise_scheduler import NoiseScheduler
 
 class ModelTrainer():
     def __init__(
@@ -17,7 +17,7 @@ class ModelTrainer():
             weight_decay:float = 0.01,
             warmup_steps: int = 1000,
             grad_clip_max_norm: float = 1.0,
-            trainable_components: list[str] = ['action_routing', 'external_cond', 'adaLN_modulation'],
+            trainable_components: list[str] = [],
             debug: bool = False
     ) -> None:
         self.dit = dit
@@ -56,10 +56,20 @@ class ModelTrainer():
             trainable_components: list[str],
             debug: bool = False
     ) -> list[nn.Parameter]:
-        print(f'Training restricted to keywords: {', '.join(trainable_components)}')
+        if not trainable_components:
+            print('Training all parameters (no freeze)')
+            total_params = sum(p.numel() for p in self.dit.parameters())
+            print(f'\n--- Freeze Report ---')
+            print(f'Total Parameters: {total_params / 1e6:.2f}M')
+            print(f'Trainable Parameters: {total_params / 1e6:.2f}M')
+            print(f'Fine-tuning 100.00% of the model.')
+            print(f'----------------------\n')
+            return list(self.dit.parameters())
+
+        print(f'Training restricted to keywords: {", ".join(trainable_components)}')
         for param in self.dit.parameters():
             param.requires_grad = False
-        
+
         trainable_params: list[nn.Parameter] = []
         for name, param in self.dit.named_parameters():
             if any(key in name for key in trainable_components):
@@ -114,7 +124,7 @@ class ModelTrainer():
             if ((i + 1) % n_batches_per_print == 0):
                 print(f'Starting batch {i + 1}/{n_batches} (last batch loss: {loss_per_step[-1]:5f})')
 
-            x0 = batch['latents'].to(self.device, dtype=self.dtype)
+            x0 = batch['frames'].to(self.device, dtype=self.dtype)
             actions = batch['actions'].to(self.device, dtype=self.dtype)
             self._validate_inputs(x0, actions)
 

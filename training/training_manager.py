@@ -3,14 +3,13 @@ import json
 import os
 
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from dit.dit import DiT
-from dataset import MinecraftLatentDataset
-from common.model_trainer import ModelTrainer
-from common.rollout_sampler import RolloutSampler
-from dit.vae import AutoencoderKL
+from model.dit import DiT
+from data.dataset import MarioPixelDataset
+from training.model_trainer import ModelTrainer
+from training.rollout_sampler import RolloutSampler
+
 
 class ModelTrainingConfig(TypedDict):
     max_noise_level: int
@@ -25,26 +24,20 @@ class ModelTrainingConfig(TypedDict):
     trainable_components: list[str]
     save_dir: str | None
 
-# TODO
-# class ModelEvaluationMetrics(TypedDict):
-#   psnr: float
-#   lpips: float
-#   image_quality: float
-#   aesthetic_quality: float
-#   temporal_consistency: float
 
 class ModelTrainingResults(TypedDict):
     train_losses: list[float]
     val_losses: list[float]
     train_losses_per_step: list[list[float]]
     val_losses_per_step: list[list[float]]
-    #val_metrics: list[ModelEvaluationMetrics]
+
 
 class CheckpointState(TypedDict):
     epoch: int
     model: dict[str, Any]
     optimizer: dict[str, Any]
     scheduler: dict[str, Any]
+
 
 class TrainingManager():
     _N_DATALOADER_WORKERS = 4
@@ -58,19 +51,17 @@ class TrainingManager():
     def __init__(
             self,
             dit: DiT,
-            vae: AutoencoderKL | None,
             device: str = 'cuda',
             seed: int = 42,
             debug: bool = False
     ) -> None:
         self.dit = dit.to(device)
-        self.vae = vae.to(device) if vae is not None else None
         self.device = device
         self.debug = debug
         torch.manual_seed(seed)
 
     def train_model(self, train_dir: str, val_dir: str, config: ModelTrainingConfig) -> ModelTrainingResults:
-        assert config['max_noise_level'] > 0 
+        assert config['max_noise_level'] > 0
         assert config['clip_len'] > 0
         assert config['clip_stride'] > 0
         assert config['epochs'] > 0
@@ -79,36 +70,24 @@ class TrainingManager():
         assert config['weight_decay'] >= 0
         assert config['warmup_steps'] > 0
         assert config['grad_clip_max_norm'] > 0
-        assert not (self.vae is None and config['save_dir'] is not None)
 
         train_loader = self._build_dataloader(
-            train_dir,
-            config['batch_size'],
-            config['clip_len'],
-            config['clip_stride'],
-            shuffle=True
+            train_dir, config['batch_size'], config['clip_len'], config['clip_stride'], shuffle=True
         )
         val_loader = self._build_dataloader(
-            val_dir,
-            config['batch_size'],
-            config['clip_len'],
-            config['clip_stride'],
-            shuffle=False
+            val_dir, config['batch_size'], config['clip_len'], config['clip_stride'], shuffle=False
         )
 
+        rollout_sampler = None
         if config['save_dir'] is not None:
-            assert self.vae is not None
             rollout_sampler = RolloutSampler(
                 dit=self.dit,
-                vae=self.vae,
-                val_dataset=cast(MinecraftLatentDataset, val_loader.dataset),
+                val_dataset=cast(MarioPixelDataset, val_loader.dataset),
                 device=self.device,
                 num_samples=TrainingManager._N_ROLLOUT_SAMPLES,
                 num_frames=TrainingManager._N_ROLLOUT_FRAMES,
                 ddim_steps=TrainingManager._N_ROLLOUT_DDIM_STEPS,
             )
-        else:
-            rollout_sampler = None
 
         trainer = ModelTrainer(
             dit=self.dit,
@@ -118,79 +97,59 @@ class TrainingManager():
             weight_decay=config['weight_decay'],
             warmup_steps=config['warmup_steps'],
             grad_clip_max_norm=config['grad_clip_max_norm'],
-            debug=self.debug
+            trainable_components=config['trainable_components'],
+            debug=self.debug,
         )
 
-        results = self._run_training(trainer, train_loader, val_loader, rollout_sampler, config)
+        return self._run_training(trainer, train_loader, val_loader, rollout_sampler, config)
 
-        return results
-    
     def _run_training(
             self,
             trainer: ModelTrainer,
-            train_loader: DataLoader[MinecraftLatentDataset],
-            val_loader: DataLoader[MinecraftLatentDataset],
+            train_loader: DataLoader,
+            val_loader: DataLoader,
             rollout_sampler: RolloutSampler | None,
-            config: ModelTrainingConfig
+            config: ModelTrainingConfig,
     ) -> ModelTrainingResults:
         train_losses: list[float] = []
         val_losses: list[float] = []
         train_losses_per_step: list[list[float]] = []
         val_losses_per_step: list[list[float]] = []
-        # val_metrics: list[ModelEvaluationMetrics] = []
 
         print(f'Training batches: {len(train_loader)}')
         print(f'Val batches: {len(val_loader)}')
 
         for epoch in range(1, config['epochs'] + 1):
-            print(f'------------------------------ Epoch {epoch}/{config['epochs']} ------------------------------')
-            print(f'Starting training epoch')
-            train_loss, epoch_train_losses_per_step = trainer.train_epoch(train_loader, TrainingManager._N_BATCHES_PER_PRINT)
-
-            print(f'Starting validation epoch')
-            val_loss, epoch_val_losses_per_step = trainer.eval_epoch(val_loader)
+            print(f'------------------------------ Epoch {epoch}/{config["epochs"]} ------------------------------')
+            train_loss, epoch_train_steps = trainer.train_epoch(train_loader, TrainingManager._N_BATCHES_PER_PRINT)
+            val_loss, epoch_val_steps = trainer.eval_epoch(val_loader)
 
             train_losses.append(train_loss)
             val_losses.append(val_loss)
-            train_losses_per_step.append(epoch_train_losses_per_step)
-            val_losses_per_step.append(epoch_val_losses_per_step)
+            train_losses_per_step.append(epoch_train_steps)
+            val_losses_per_step.append(epoch_val_steps)
 
             print(f'Epoch {epoch} - train loss: {train_loss:.5f}, val loss: {val_loss:.5f}')
 
-            self._compute_evaluation_metrics(val_loader, rollout_sampler, epoch, config['save_dir'])
-            # metrics = self._compute_evaluation_metrics(val_loader, rollout_sampler, epoch, config['save_dir'])
-            # val_metrics.append(metrics)
-            # self._print_evaluation_metrics(metrics)
+            if rollout_sampler is not None and config['save_dir'] is not None:
+                print('Generating rollout samples')
+                for p in rollout_sampler.sample(epoch, config['save_dir']):
+                    print(f'\tsaved {p}')
 
             if config['save_dir'] is not None:
                 self._save_checkpoint(trainer, config['save_dir'], epoch)
 
-        results = self._format_results(
-            train_losses,
-            val_losses,
-            train_losses_per_step,
-            val_losses_per_step
+        results = ModelTrainingResults(
+            train_losses=train_losses,
+            val_losses=val_losses,
+            train_losses_per_step=train_losses_per_step,
+            val_losses_per_step=val_losses_per_step,
         )
-        # results = self._format_results(train_losses, val_losses, val_metrics)
 
         if config['save_dir'] is not None:
             self._save_training_results(results, config['save_dir'])
 
         return results
-
-    def _compute_evaluation_metrics(
-            self,
-            val_loader: DataLoader[MinecraftLatentDataset],
-            rollout_sampler: RolloutSampler | None,
-            epoch: int,
-            save_dir: str | None
-    ) -> None:
-        if save_dir is not None:
-            assert rollout_sampler is not None
-            print('Generating rollout samples')
-            paths = rollout_sampler.sample(epoch, save_dir)
-            for p in paths:
-                print(f'\tsaved {p}')
 
     def _build_dataloader(
             self,
@@ -198,44 +157,26 @@ class TrainingManager():
             batch_size: int,
             clip_len: int,
             clip_stride: int,
-            shuffle: bool
-    ) -> DataLoader[MinecraftLatentDataset]:
-        dataset = MinecraftLatentDataset(data_folder_path, clip_len, clip_stride)
-        dataset_loader = DataLoader(
+            shuffle: bool,
+    ) -> DataLoader:
+        dataset = MarioPixelDataset(data_folder_path, clip_len, clip_stride)
+        return DataLoader(
             dataset,
             batch_size,
             shuffle=shuffle,
             num_workers=TrainingManager._N_DATALOADER_WORKERS,
-            pin_memory=TrainingManager._N_DATALOADER_WORKERS > 0
+            pin_memory=TrainingManager._N_DATALOADER_WORKERS > 0,
         )
-        return dataset_loader
-
-    def _format_results(
-            self,
-            train_losses: list[float],
-            val_losses: list[float],
-            train_losses_per_step: list[list[float]],
-            val_losses_per_step: list[list[float]],
-            # val_metrics: list[ModelEvaluationMetrics]
-    ) -> ModelTrainingResults:
-        return ModelTrainingResults({
-            'train_losses': train_losses,
-            'val_losses': val_losses,
-            'train_losses_per_step': train_losses_per_step,
-            'val_losses_per_step': val_losses_per_step
-            # 'val_metrics': val_metrics
-        })
 
     def _save_checkpoint(self, trainer: ModelTrainer, save_dir: str, epoch: int) -> None:
         os.makedirs(save_dir, exist_ok=True)
         ckpt_name = f'{TrainingManager._CKPT_FILE_PREFIX}{epoch}.pt'
-        full_path = os.path.join(save_dir, ckpt_name)
         torch.save(CheckpointState(
             epoch=epoch,
             model=self.dit.state_dict(),
             optimizer=trainer.get_optimizer().state_dict(),
-            scheduler=trainer.get_scheduler().state_dict()
-        ), full_path)
+            scheduler=trainer.get_scheduler().state_dict(),
+        ), os.path.join(save_dir, ckpt_name))
 
     def _save_training_results(self, results: ModelTrainingResults, save_dir: str) -> None:
         os.makedirs(save_dir, exist_ok=True)
