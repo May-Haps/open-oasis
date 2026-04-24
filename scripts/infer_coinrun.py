@@ -179,12 +179,20 @@ def main(args: argparse.Namespace) -> None:
     print(f"Action source : {args.action_source}")
     print(f"Device        : {DEVICE}")
 
-    model = CoinRunWorldModelSmall().to(DEVICE)
     ckpt  = torch.load(args.ckpt, weights_only=True, map_location=DEVICE)
+    ckpt_config = ckpt.get("config", {}) if isinstance(ckpt, dict) else {}
+    action_cond_mode = ckpt_config.get("action_cond_mode", "linear")
+    action_cond_dropout = ckpt_config.get("action_cond_dropout", 0.1)
+
+    model = CoinRunWorldModelSmall(
+        external_cond_mode=action_cond_mode,
+        external_cond_dropout=action_cond_dropout,
+    ).to(DEVICE)
     model.load_state_dict(ckpt["model"])
     model.eval()
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
     print(f"Params        : {n_params:.1f}M  (step={ckpt.get('step')}, epoch={ckpt.get('epoch')})")
+    print(f"Action cond   : mode={action_cond_mode}, dropout={action_cond_dropout}")
 
     betas          = sigmoid_beta_schedule(1000).float().to(DEVICE)
     alphas_cumprod = rearrange(torch.cumprod(1.0 - betas, dim=0), "T -> T 1 1 1")

@@ -2,7 +2,11 @@
 Train CoinRun world model with WandB logging and checkpointing.
 
 Setup:
-    pip install wandb array-record grain-nightly
+    pip install wandb array-record grain-nightly pyiqa transformers
+
+    # Optional rollout-eval extras:
+    # - `pyiqa` enables MUSIQ and LAION-AES logging
+    # - `transformers` enables CLIP-based temporal consistency logging
 
     # Preprocess (run once per split):
     python data/preprocess_coinrun.py --input-dir data/coinrun_raw/train --output-dir data/coinrun_processed/train
@@ -39,6 +43,7 @@ from torch.utils.data import DataLoader
 from torchvision.utils import make_grid
 
 from data.dataset_coinrun_streaming import CoinRunStreamingDataset
+from eval import evaluate_noise_loss_and_recon, evaluate_rollouts
 from model.dit import CoinRunWorldModel, CoinRunWorldModelSmall
 from model.utils import sigmoid_beta_schedule
 from training.noise_scheduler import NoiseScheduler
@@ -54,6 +59,7 @@ CONFIG = {
 
     # Model
     "max_noise_level": 1000,
+    "action_cond_mode": "one_hot_embedding",  # baseline="linear", learned table="one_hot_embedding"
     "action_cond_dropout": 0.1,  # Set to 0.0 to disable action-conditioning dropout.
 
     # Data
@@ -80,6 +86,7 @@ CONFIG = {
     "n_prompt_frames":     1,
     "rollout_frames":      16,     # frames to generate per sample
     "n_rollout_samples":   4,      # how many val clips to visualise
+    "eval_rollout_samples": 4,     # final eval.py-style rollout evaluation on val split
 
     # WandB
     "wandb_project": "coinrun-world-model",
@@ -424,6 +431,15 @@ def main(args):
 
     assert torch.cuda.is_available(), "CUDA required"
 
+    model_config = dict(CONFIG)
+    if args.resume:
+        resume_ckpt = torch.load(args.resume, weights_only=True, map_location="cpu")
+        resume_config = resume_ckpt.get("config", {})
+        model_config["action_cond_mode"] = resume_config.get("action_cond_mode", "linear")
+        model_config["action_cond_dropout"] = resume_config.get(
+            "action_cond_dropout", model_config["action_cond_dropout"]
+        )
+
     save_dir = Path(CONFIG["save_dir"])
     if is_main:
         save_dir.mkdir(parents=True, exist_ok=True)
@@ -433,7 +449,7 @@ def main(args):
         run = wandb.init(
             project=CONFIG["wandb_project"],
             entity=CONFIG["wandb_entity"],
-            config=CONFIG,
+            config=model_config,
             resume="allow",
             id=wandb.util.generate_id() if not args.resume else None,
             dir=str(save_dir),
@@ -442,7 +458,8 @@ def main(args):
 
     # --- Model ---
     raw_model = CoinRunWorldModelSmall(
-        external_cond_dropout=CONFIG["action_cond_dropout"]
+        external_cond_dropout=model_config["action_cond_dropout"],
+        external_cond_mode=model_config["action_cond_mode"],
     ).to(device)
     if is_main:
         print(f"Parameters: {sum(p.numel() for p in raw_model.parameters()) / 1e6:.1f}M")
@@ -508,7 +525,7 @@ def main(args):
             print(f"Resumed from {args.resume} (epoch={start_epoch}, step={global_step})")
 
     if is_main:
-        (save_dir / "config.json").write_text(json.dumps(CONFIG, indent=2))
+        (save_dir / "config.json").write_text(json.dumps(model_config, indent=2))
 
     if is_ddp:
         dist.barrier()
@@ -557,7 +574,7 @@ def main(args):
                 if global_step % CONFIG["ckpt_every_steps"] == 0:
                     ckpt_path = str(save_dir / f"ckpt_step_{global_step:07d}.pt")
                     save_checkpoint(ckpt_path, raw_model, optimizer, scheduler,
-                                    epoch, global_step, None, CONFIG)
+                                    epoch, global_step, None, model_config)
                     wandb.save(ckpt_path, base_path=str(save_dir))
                     print(f"[step {global_step}] checkpoint saved")
 
@@ -611,18 +628,57 @@ def main(args):
 
             ckpt_path = str(save_dir / f"ckpt_epoch_{epoch+1:03d}.pt")
             save_checkpoint(ckpt_path, raw_model, optimizer, scheduler,
-                            epoch + 1, global_step, val_loss, CONFIG)
+                            epoch + 1, global_step, val_loss, model_config)
             wandb.save(ckpt_path, base_path=str(save_dir))
 
             if val_loss < best_val:
                 best_val = val_loss
                 best_path = str(save_dir / "ckpt_best.pt")
                 save_checkpoint(best_path, raw_model, optimizer, scheduler,
-                                epoch + 1, global_step, val_loss, CONFIG)
+                                epoch + 1, global_step, val_loss, model_config)
                 wandb.save(best_path, base_path=str(save_dir))
                 print(f"  ↳ new best val loss: {best_val:.4f}")
 
+    if is_ddp:
+        dist.barrier()
+
     if is_main:
+        final_eval_metrics = evaluate_noise_loss_and_recon(
+            model=raw_model,
+            loader=val_loader,
+            noise_scheduler=noise_scheduler,
+            device=device,
+            max_noise_level=CONFIG["max_noise_level"],
+            max_batches=None,
+        )
+        final_rollout_metrics = evaluate_rollouts(
+            model=raw_model,
+            dataset=val_ds,
+            device=device,
+            max_noise_level=CONFIG["max_noise_level"],
+            ddim_steps=CONFIG["ddim_steps"],
+            n_prompt_frames=CONFIG["n_prompt_frames"],
+            rollout_frames=CONFIG["rollout_frames"],
+            num_samples=CONFIG["eval_rollout_samples"],
+            save_dir=save_dir / "final_eval_rollouts",
+        )
+        final_eval_metrics.update(final_rollout_metrics)
+        final_eval_metrics["rollout_samples"] = CONFIG["eval_rollout_samples"]
+
+        wandb.log({
+            "eval/noise_loss": final_eval_metrics["noise_loss"],
+            "eval/psnr": final_eval_metrics["psnr"],
+            "eval/ssim": final_eval_metrics["ssim"],
+            "eval/rollout_psnr": final_eval_metrics["rollout_psnr"],
+            "eval/rollout_ssim": final_eval_metrics["rollout_ssim"],
+            "eval/musiq": final_eval_metrics["musiq"],
+            "eval/laion_aes": final_eval_metrics["laion_aes"],
+            "eval/temporal_consistency": final_eval_metrics["temporal_consistency"],
+            "eval/rollout_samples": final_eval_metrics["rollout_samples"],
+        }, step=global_step)
+        (save_dir / "final_eval_metrics.json").write_text(json.dumps(final_eval_metrics, indent=2))
+        print(f"Final eval: {json.dumps(final_eval_metrics, indent=2)}")
+
         wandb.finish()
     if is_ddp:
         dist.destroy_process_group()
