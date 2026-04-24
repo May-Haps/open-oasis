@@ -129,7 +129,6 @@ CONFIG = {
     "epochs":              10,
     "lr":                  1e-4,
     "action_cond_mode":    "one_hot_embedding",  # "linear" for baseline, learned table for embedding-based conditioning
-    "action_cond_dropout": 0.1,     # use 0.0 to disable action-conditioning dropout
     "ckpt_every_steps":    10000,
     "rollout_every_steps": 1000,    # generate video every N steps
     "val_every_steps":     5000,    # fast val loss check (50 batches)

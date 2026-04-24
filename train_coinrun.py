@@ -60,7 +60,6 @@ CONFIG = {
     # Model
     "max_noise_level": 1000,
     "action_cond_mode": "one_hot_embedding",  # baseline="linear", learned table="one_hot_embedding"
-    "action_cond_dropout": 0.1,  # Set to 0.0 to disable action-conditioning dropout.
 
     # Data
     "clip_len":   32,
@@ -436,9 +435,6 @@ def main(args):
         resume_ckpt = torch.load(args.resume, weights_only=True, map_location="cpu")
         resume_config = resume_ckpt.get("config", {})
         model_config["action_cond_mode"] = resume_config.get("action_cond_mode", "linear")
-        model_config["action_cond_dropout"] = resume_config.get(
-            "action_cond_dropout", model_config["action_cond_dropout"]
-        )
 
     save_dir = Path(CONFIG["save_dir"])
     if is_main:
@@ -458,7 +454,6 @@ def main(args):
 
     # --- Model ---
     raw_model = CoinRunWorldModelSmall(
-        external_cond_dropout=model_config["action_cond_dropout"],
         external_cond_mode=model_config["action_cond_mode"],
     ).to(device)
     if is_main:

@@ -51,7 +51,6 @@ def main() -> None:
         "trainable_components": [],   # empty = train all
         "save_dir":           SAVE_DIR,
     }
-    ACTION_COND_DROPOUT = 0.1  # Set to 0.0 to disable action-conditioning dropout.
     # ==============================================================
 
     assert torch.cuda.is_available(), "CUDA is required."
@@ -68,7 +67,7 @@ def main() -> None:
 
     set_seeds(SEED)
 
-    dit = MarioWorldModel(external_cond_dropout=ACTION_COND_DROPOUT)
+    dit = MarioWorldModel()
 
     if CKPT is not None:
         state = torch.load(CKPT, weights_only=True)
@@ -83,7 +82,6 @@ def main() -> None:
             json.dump(
                 {
                     "config": dict(CONFIG),
-                    "action_cond_dropout": ACTION_COND_DROPOUT,
                     "ckpt": CKPT,
                     "device": DEVICE,
                     "seed": SEED,

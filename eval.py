@@ -75,17 +75,14 @@ def infer_coinrun_model(state_dict: dict[str, torch.Tensor], ckpt_config: dict) 
     }
     depth = len(block_ids)
     action_cond_mode = ckpt_config.get("action_cond_mode", "linear")
-    action_cond_dropout = ckpt_config.get("action_cond_dropout", 0.1)
 
     if hidden_size == 512 and depth == 6:
         return CoinRunWorldModelSmall(
             external_cond_mode=action_cond_mode,
-            external_cond_dropout=action_cond_dropout,
         )
     if hidden_size == 640 and depth == 8:
         return CoinRunWorldModel(
             external_cond_mode=action_cond_mode,
-            external_cond_dropout=action_cond_dropout,
         )
 
     raise ValueError(
@@ -411,7 +408,6 @@ def main(args: argparse.Namespace) -> None:
     metrics["checkpoint"] = args.ckpt
     metrics["data_dir"] = args.data_dir
     metrics["action_cond_mode"] = ckpt_config.get("action_cond_mode", "linear")
-    metrics["action_cond_dropout"] = ckpt_config.get("action_cond_dropout", 0.1)
 
     print(json.dumps(metrics, indent=2))
 
