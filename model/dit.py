@@ -373,3 +373,34 @@ def CoinRunWorldModelSmall():
         external_cond_dim=15,
         max_frames=32,
     )
+
+# def CoinRunWorldModel5M():
+#     """~5M params: hidden=152, depth=6, heads=8"""
+#     return DiT(
+#         input_h=64, input_w=64, patch_size=8, in_channels=3,
+#         hidden_size=152, depth=6, num_heads=8,
+#         external_cond_dim=15, max_frames=32,
+#     )
+
+# def CoinRunWorldModel9M():
+#     """~9M params: hidden=200, depth=6, heads=8"""
+#     return DiT(
+#         input_h=64, input_w=64, patch_size=8, in_channels=3,
+#         hidden_size=200, depth=6, num_heads=8,
+#         external_cond_dim=15, max_frames=32,
+#     )
+def CoinRunWorldModel5M():
+    """~5M params: hidden=160, depth=5, num_heads=8"""
+    return DiT(
+        input_h=64, input_w=64, patch_size=8, in_channels=3,
+        hidden_size=160, depth=5, num_heads=8,
+        external_cond_dim=15, max_frames=32,
+    )
+
+def CoinRunWorldModel9M():
+    """~9M params: hidden=224, depth=5, num_heads=8"""
+    return DiT(
+        input_h=64, input_w=64, patch_size=8, in_channels=3,
+        hidden_size=224, depth=5, num_heads=8,
+        external_cond_dim=15, max_frames=32,
+    )

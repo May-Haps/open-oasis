@@ -39,51 +39,9 @@ from torch.utils.data import DataLoader
 from torchvision.utils import make_grid
 
 from data.dataset_coinrun_streaming import CoinRunStreamingDataset
-from model.dit import CoinRunWorldModel, CoinRunWorldModelSmall
+from model.dit import CoinRunWorldModel5M, CoinRunWorldModel9M, CoinRunWorldModelSmall
 from model.utils import sigmoid_beta_schedule
 from training.noise_scheduler import NoiseScheduler
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-CONFIG = {
-    # Paths
-    "train_dir":  "data/coinrun/train",
-    "val_dir":    "data/coinrun/val",
-    "save_dir":   "runs/coinrun_v1",
-
-    # Model
-    "max_noise_level": 1000,
-
-    # Data
-    "clip_len":   32,
-    "clip_stride": 8,
-
-    # Training
-    "epochs":          10,       # stop early if time budget hit; checkpoints preserve progress
-    "batch_size":      128,
-    "lr":              1e-4,
-    "weight_decay":    0.01,
-    "warmup_steps":    2000,
-    "grad_clip":       1.0,
-
-    # Logging / saving
-    "ckpt_every_steps":    10000,  # checkpoint every ~8 min at ~20 it/s
-    "rollout_every_steps": 1000,   # generate + log video every ~1k steps
-    "val_every_steps":     5000,   # fast val loss (subset) every N steps
-    "val_subset_batches":  50,     # how many val batches for the fast check (~8s)
-    "log_every_steps":     50,     # wandb loss every N steps
-
-    # Rollout generation
-    "ddim_steps":          10,
-    "n_prompt_frames":     1,
-    "rollout_frames":      16,     # frames to generate per sample
-    "n_rollout_samples":   4,      # how many val clips to visualise
-
-    # WandB
-    "wandb_project": "coinrun-world-model",
-    "wandb_entity":  "spring26-gen-ai",
-}
 
 
 # ---------------------------------------------------------------------------
@@ -325,25 +283,33 @@ def train_step(
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     device: str,
     grad_clip: float,
-) -> float:
+    accum_step: int,        # which micro-step within the accumulation window (0-indexed)
+    grad_accum_steps: int,  # total micro-steps before an optimizer update
+) -> tuple[float, bool]: 
     x0      = batch["frames"].to(device)
     actions = batch["actions"].to(device)
     B, T    = x0.shape[:2]
 
-    optimizer.zero_grad()
+    
     t     = torch.randint(0, noise_scheduler.timesteps, (B, T), device=device)
     noise = torch.randn_like(x0)
     xt, v_target = noise_scheduler.noised_sample_and_velocity_target(x0 * 2 - 1, t, noise)
 
     with autocast("cuda", dtype=torch.bfloat16):
         v_pred = model(xt, t, actions)
-        loss = nn.functional.mse_loss(v_pred, v_target)
+        loss = nn.functional.mse_loss(v_pred, v_target) / grad_accum_steps
 
     loss.backward()
-    nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    optimizer.step()
-    scheduler.step()
-    return loss.item()
+    stepped = False
+
+    if (accum_step + 1) % grad_accum_steps == 0:
+        nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad()
+        stepped = True
+
+    return loss.item() * grad_accum_steps, stepped
 
 
 @torch.no_grad()
@@ -406,6 +372,33 @@ def val_epoch(
 # Main
 # ---------------------------------------------------------------------------
 def main(args):
+    CONFIG = {
+        "train_dir":  "data/coinrun_raw/train",
+        "val_dir":    "data/coinrun_raw/val",
+        "save_dir":   f"runs/coinrun_{args.model_size}",
+        "max_noise_level": 1000,
+        "clip_len":   32,
+        "clip_stride": 8,
+        "epochs":     999,          # effectively unlimited — time stops the run
+        "batch_size": 128,          # per-step batch (physical)
+        "grad_accum_steps": 2,      # effective batch = 128 × 2 = 256
+        "lr":         1e-4,
+        "weight_decay": 0.01,
+        "warmup_steps": 2000,
+        "grad_clip":  1.0,
+        "max_hours":  args.max_hours,
+        "ckpt_every_steps":    10000,
+        "rollout_every_steps": 1000,
+        "val_every_steps":     5000,
+        "val_subset_batches":  50,
+        "log_every_steps":     50,
+        "ddim_steps":          10,
+        "n_prompt_frames":     1,
+        "rollout_frames":      16,
+        "n_rollout_samples":   4,
+        "wandb_project": "coinrun-scaling",
+        "wandb_entity":  "spring26-gen-ai",
+    }
     # --- DDP setup ---
     is_ddp = "LOCAL_RANK" in os.environ
     if is_ddp:
@@ -429,18 +422,29 @@ def main(args):
 
     # --- WandB (rank 0 only) ---
     if is_main:
+        wandb_id_file = save_dir / "wandb_run_id.txt"
+        if args.resume and wandb_id_file.exists():
+            wandb_id = wandb_id_file.read_text().strip()
+        else:
+            wandb_id = wandb.util.generate_id()
+
         run = wandb.init(
             project=CONFIG["wandb_project"],
             entity=CONFIG["wandb_entity"],
             config=CONFIG,
             resume="allow",
-            id=wandb.util.generate_id() if not args.resume else None,
+            id=wandb_id,
             dir=str(save_dir),
         )
         (save_dir / "wandb_run_id.txt").write_text(run.id)
 
     # --- Model ---
-    raw_model = CoinRunWorldModelSmall().to(device)
+    model_map = {
+        "5m":    CoinRunWorldModel5M,
+        "9m":    CoinRunWorldModel9M,
+        "small": CoinRunWorldModelSmall,
+    }
+    raw_model = model_map[args.model_size]().to(device)
     if is_main:
         print(f"Parameters: {sum(p.numel() for p in raw_model.parameters()) / 1e6:.1f}M")
     model = DDP(raw_model, device_ids=[local_rank]) if is_ddp else raw_model
@@ -511,34 +515,53 @@ def main(args):
         dist.barrier()
 
     # --- Training loop ---
+    optimizer.zero_grad()
     model.train()
     t0 = time.time()
 
+    time_up = False
+
     for epoch in range(start_epoch, CONFIG["epochs"]):
         epoch_loss, epoch_steps = 0.0, 0
+        optimizer.zero_grad()
 
         total_batches = len(train_ds) // (CONFIG["batch_size"] * world_size)  # len() returns full dataset size; dataset already sharded by rank
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}", total=total_batches,
                     dynamic_ncols=True, disable=not is_main)
-        for batch in pbar:
-            loss = train_step(
+        for micro_step, batch in enumerate(pbar):
+            loss, did_step = train_step(
                 model, batch, noise_scheduler,
                 optimizer, scheduler, device, CONFIG["grad_clip"],
+                accum_step=micro_step,
+                grad_accum_steps=CONFIG["grad_accum_steps"],
             )
+            epoch_loss  += loss
+            epoch_steps += 1
+
+            if not did_step: # haven't completed an effective step yet
+                    continue
+
             global_step  += 1
-            epoch_loss   += loss
-            epoch_steps  += 1
             pbar.set_postfix(loss=f"{loss:.4f}", step=global_step)
+
+            # ---- time-based stopping ----
+            if (time.time() - t0) > CONFIG["max_hours"] * 3600:
+                if is_main:
+                    print(f"Reached {CONFIG['max_hours']}h limit at step {global_step}, stopping.")
+                time_up = True
+                break
 
             if is_main:
                 # --- Loss log ---
                 if global_step % CONFIG["log_every_steps"] == 0:
-                    elapsed = (time.time() - t0) / 3600
+                    n_params = sum(p.numel() for p in raw_model.parameters())
+                    flops_per_eff_step = 6 * n_params * CONFIG["batch_size"] * CONFIG["grad_accum_steps"] * CONFIG["clip_len"]
                     wandb.log({
-                        "train/loss": loss,
-                        "train/lr":   scheduler.get_last_lr()[0],
-                        "perf/elapsed_hours": elapsed,
-                        "perf/steps_per_sec": global_step / (time.time() - t0),
+                        "train/loss":             loss,
+                        "train/lr":               scheduler.get_last_lr()[0],
+                        "train/cumulative_flops": flops_per_eff_step * global_step,
+                        "perf/elapsed_hours":     (time.time() - t0) / 3600,
+                        "perf/steps_per_sec":     global_step / (time.time() - t0),
                     }, step=global_step)
 
                 # --- Fast val loss (subset) ---
@@ -585,6 +608,9 @@ def main(args):
                     }, step=global_step)
                     print(f"[step {global_step}] rollout saved → {local_path}")
 
+        if time_up:
+            break 
+
         # --- End of epoch ---
         avg_train_loss = epoch_loss / max(epoch_steps, 1)
         val_loss, psnr, ssim = val_epoch(model, val_loader, noise_scheduler, device, alphas_cumprod)
@@ -620,13 +646,20 @@ def main(args):
                 print(f"  ↳ new best val loss: {best_val:.4f}")
 
     if is_main:
+        final_ckpt = str(save_dir / f"ckpt_step_{global_step:07d}_final.pt")
+        save_checkpoint(final_ckpt, raw_model, optimizer, scheduler,
+                        epoch, global_step, None, CONFIG)
+        print(f"Final checkpoint saved → {final_ckpt}")
         wandb.finish()
+
     if is_ddp:
         dist.destroy_process_group()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("--model-size", choices=["5m", "9m", "small"], default="small")
+    parser.add_argument("--max-hours", type=float, default=12.0)
     parser.add_argument("--resume", type=str, default=None,
                         help="Path to checkpoint to resume from")
     main(parser.parse_args())
