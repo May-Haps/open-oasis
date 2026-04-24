@@ -128,6 +128,42 @@ class FinalLayer(nn.Module):
         return x
 
 
+class ActionConditioner(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_size: int,
+        mode: Literal["linear", "one_hot_embedding"] = "linear",
+    ):
+        super().__init__()
+        self.input_dim = input_dim
+        self.mode = mode
+
+        if mode == "linear":
+            # Keep the Sequential wrapper so older linear-mode checkpoints
+            # still match the same state_dict key names (`conditioner.0.*`).
+            self.conditioner = nn.Sequential(nn.Linear(input_dim, hidden_size))
+        elif mode == "one_hot_embedding":
+            self.null_action_idx = input_dim
+            self.embedding = nn.Embedding(
+                num_embeddings=input_dim + 1,
+                embedding_dim=hidden_size,
+                padding_idx=self.null_action_idx,
+            )
+        else:
+            raise ValueError(f"Unsupported action conditioning mode: {mode}")
+
+    def forward(self, actions: torch.Tensor) -> torch.Tensor:
+        if self.mode == "linear":
+            return self.conditioner(actions)
+
+        has_action = actions.sum(dim=-1) > 0
+        action_ids = actions.argmax(dim=-1)
+        null_ids = torch.full_like(action_ids, self.null_action_idx)
+        action_ids = torch.where(has_action, action_ids, null_ids)
+        return self.embedding(action_ids)
+
+
 class SpatioTemporalDiTBlock(nn.Module):
     def __init__(
         self,
@@ -207,6 +243,7 @@ class DiT(nn.Module):
         num_heads=16,
         mlp_ratio=4.0,
         external_cond_dim=25,
+        external_cond_mode: Literal["linear", "one_hot_embedding"] = "linear",
         max_frames=32,
     ):
         super().__init__()
@@ -222,9 +259,19 @@ class DiT(nn.Module):
 
         self.spatial_rotary_emb = RotaryEmbedding(dim=hidden_size // num_heads // 2, freqs_for="pixel", max_freq=256)
         self.temporal_rotary_emb = RotaryEmbedding(dim=hidden_size // num_heads)
-        self.external_cond = nn.Linear(external_cond_dim, hidden_size) if external_cond_dim > 0 else nn.Identity()
+        self.external_cond = (
+            ActionConditioner(
+                input_dim=external_cond_dim,
+                hidden_size=hidden_size,
+                mode=external_cond_mode,
+            )
+            if external_cond_dim > 0
+            else nn.Identity()
+        )
+
 
         self.external_cond_dim = external_cond_dim
+        self.external_cond_mode = external_cond_mode
 
         self.blocks = nn.ModuleList(
             [
@@ -336,7 +383,9 @@ def MarioWorldModel():
     )
 
 
-def CoinRunWorldModel():
+def CoinRunWorldModel(
+    external_cond_mode: Literal["linear", "one_hot_embedding"] = "linear",
+):
     """
     Pixel-space DiT for 64×64 CoinRun frames. ~100M params.
     15 discrete Procgen actions (one-hot).
@@ -351,11 +400,14 @@ def CoinRunWorldModel():
         depth=8,
         num_heads=8,
         external_cond_dim=15,
+        external_cond_mode=external_cond_mode,
         max_frames=32,
     )
 
 
-def CoinRunWorldModelSmall():
+def CoinRunWorldModelSmall(
+    external_cond_mode: Literal["linear", "one_hot_embedding"] = "linear",
+):
     """
     Pixel-space DiT for 64×64 CoinRun frames. ~60M params.
     Same architecture as CoinRunWorldModel but hidden=512, depth=6.
@@ -371,6 +423,7 @@ def CoinRunWorldModelSmall():
         depth=6,
         num_heads=8,
         external_cond_dim=15,
+        external_cond_mode=external_cond_mode,
         max_frames=32,
     )
 
@@ -389,18 +442,20 @@ def CoinRunWorldModelSmall():
 #         hidden_size=200, depth=6, num_heads=8,
 #         external_cond_dim=15, max_frames=32,
 #     )
-def CoinRunWorldModel5M():
-    """~5M params: hidden=160, depth=5, num_heads=8"""
+def CoinRunWorldModel5M(
+    external_cond_mode: Literal["linear", "one_hot_embedding"] = "linear",
+):
     return DiT(
         input_h=64, input_w=64, patch_size=8, in_channels=3,
         hidden_size=160, depth=5, num_heads=8,
-        external_cond_dim=15, max_frames=32,
+        external_cond_dim=15, external_cond_mode=external_cond_mode, max_frames=32,
     )
 
-def CoinRunWorldModel9M():
-    """~9M params: hidden=224, depth=5, num_heads=8"""
+def CoinRunWorldModel9M(
+    external_cond_mode: Literal["linear", "one_hot_embedding"] = "linear",
+):
     return DiT(
         input_h=64, input_w=64, patch_size=8, in_channels=3,
         hidden_size=224, depth=5, num_heads=8,
-        external_cond_dim=15, max_frames=32,
+        external_cond_dim=15, external_cond_mode=external_cond_mode, max_frames=32,
     )

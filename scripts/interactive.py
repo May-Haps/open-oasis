@@ -29,7 +29,7 @@ from train_coinrun import generate_rollout
 
 SCALE    = 6      # 64 → 384px display
 DEVICE   = "cuda" if torch.cuda.is_available() else "cpu"
-DATA_DIR = "data/coinrun/val"
+DATA_DIR = "data/coinrun_raw/val"
 
 # Procgen action indices
 ACTIONS = {
@@ -51,11 +51,18 @@ _ds             = None
 
 def load_model(ckpt_path: str):
     global _model, _alphas_cumprod, _ds
-    _model = CoinRunWorldModelSmall().to(DEVICE)
     ckpt   = torch.load(ckpt_path, weights_only=True, map_location=DEVICE)
+    ckpt_config = ckpt.get("config", {}) if isinstance(ckpt, dict) else {}
+    action_cond_mode = ckpt_config.get("action_cond_mode", "linear")
+    _model = CoinRunWorldModelSmall(
+        external_cond_mode=action_cond_mode,
+    ).to(DEVICE)
     _model.load_state_dict(ckpt["model"])
     _model.eval()
-    print(f"Loaded {ckpt_path}  step={ckpt.get('step')}")
+    print(
+        f"Loaded {ckpt_path}  step={ckpt.get('step')}  "
+        f"action_cond={action_cond_mode}"
+    )
 
     betas           = sigmoid_beta_schedule(1000).float().to(DEVICE)
     _alphas_cumprod = rearrange(torch.cumprod(1.0 - betas, dim=0), "T -> T 1 1 1")

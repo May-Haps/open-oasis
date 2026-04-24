@@ -43,6 +43,8 @@ from model.dit import CoinRunWorldModel5M, CoinRunWorldModel9M, CoinRunWorldMode
 from model.utils import sigmoid_beta_schedule
 from training.noise_scheduler import NoiseScheduler
 
+from eval import evaluate_noise_loss_and_recon, evaluate_rollouts
+
 
 # ---------------------------------------------------------------------------
 # Rollout generation
@@ -398,6 +400,8 @@ def main(args):
         "n_rollout_samples":   4,
         "wandb_project": "coinrun-scaling",
         "wandb_entity":  "spring26-gen-ai",
+        "action_cond_mode": "one_hot_embedding",
+        "eval_rollout_samples": 4,
     }
     # --- DDP setup ---
     is_ddp = "LOCAL_RANK" in os.environ
@@ -416,6 +420,12 @@ def main(args):
 
     assert torch.cuda.is_available(), "CUDA required"
 
+    model_config = dict(CONFIG)
+    if args.resume:
+        resume_ckpt = torch.load(args.resume, weights_only=True, map_location="cpu")
+        resume_config = resume_ckpt.get("config", {})
+        model_config["action_cond_mode"] = resume_config.get("action_cond_mode", "linear")
+
     save_dir = Path(CONFIG["save_dir"])
     if is_main:
         save_dir.mkdir(parents=True, exist_ok=True)
@@ -431,7 +441,7 @@ def main(args):
         run = wandb.init(
             project=CONFIG["wandb_project"],
             entity=CONFIG["wandb_entity"],
-            config=CONFIG,
+            config=model_config,
             resume="allow",
             id=wandb_id,
             dir=str(save_dir),
@@ -444,7 +454,9 @@ def main(args):
         "9m":    CoinRunWorldModel9M,
         "small": CoinRunWorldModelSmall,
     }
-    raw_model = model_map[args.model_size]().to(device)
+    raw_model = model_map[args.model_size](
+        external_cond_mode=model_config["action_cond_mode"],
+    ).to(device)
     if is_main:
         print(f"Parameters: {sum(p.numel() for p in raw_model.parameters()) / 1e6:.1f}M")
     model = DDP(raw_model, device_ids=[local_rank]) if is_ddp else raw_model
@@ -509,10 +521,10 @@ def main(args):
             print(f"Resumed from {args.resume} (epoch={start_epoch}, step={global_step})")
 
     if is_main:
-        (save_dir / "config.json").write_text(json.dumps(CONFIG, indent=2))
+        (save_dir / "config.json").write_text(json.dumps(model_config, indent=2))
 
     if is_ddp:
-        dist.barrier()
+        dist.barrier() 
 
     # --- Training loop ---
     optimizer.zero_grad()
@@ -577,7 +589,7 @@ def main(args):
                 if global_step % CONFIG["ckpt_every_steps"] == 0:
                     ckpt_path = str(save_dir / f"ckpt_step_{global_step:07d}.pt")
                     save_checkpoint(ckpt_path, raw_model, optimizer, scheduler,
-                                    epoch, global_step, None, CONFIG)
+                                    epoch, global_step, None, model_config)
                     wandb.save(ckpt_path, base_path=str(save_dir))
                     print(f"[step {global_step}] checkpoint saved")
 
@@ -634,24 +646,60 @@ def main(args):
 
             ckpt_path = str(save_dir / f"ckpt_epoch_{epoch+1:03d}.pt")
             save_checkpoint(ckpt_path, raw_model, optimizer, scheduler,
-                            epoch + 1, global_step, val_loss, CONFIG)
+                            epoch + 1, global_step, val_loss, model_config)
             wandb.save(ckpt_path, base_path=str(save_dir))
 
             if val_loss < best_val:
                 best_val = val_loss
                 best_path = str(save_dir / "ckpt_best.pt")
                 save_checkpoint(best_path, raw_model, optimizer, scheduler,
-                                epoch + 1, global_step, val_loss, CONFIG)
+                                epoch + 1, global_step, val_loss, model_config)
                 wandb.save(best_path, base_path=str(save_dir))
                 print(f"  ↳ new best val loss: {best_val:.4f}")
+
+    if is_ddp:
+        dist.barrier()
 
     if is_main:
         final_ckpt = str(save_dir / f"ckpt_step_{global_step:07d}_final.pt")
         save_checkpoint(final_ckpt, raw_model, optimizer, scheduler,
-                        epoch, global_step, None, CONFIG)
+                        epoch, global_step, None, model_config)
         print(f"Final checkpoint saved → {final_ckpt}")
-        wandb.finish()
 
+        final_eval_metrics = evaluate_noise_loss_and_recon(
+            model=raw_model,
+            loader=val_loader,
+            noise_scheduler=noise_scheduler,
+            device=device,
+            max_noise_level=CONFIG["max_noise_level"],
+            max_batches=None,
+        )
+        final_rollout_metrics = evaluate_rollouts(
+            model=raw_model,
+            dataset=val_ds,
+            device=device,
+            max_noise_level=CONFIG["max_noise_level"],
+            ddim_steps=CONFIG["ddim_steps"],
+            n_prompt_frames=CONFIG["n_prompt_frames"],
+            rollout_frames=CONFIG["rollout_frames"],
+            num_samples=CONFIG["eval_rollout_samples"],
+            save_dir=save_dir / "final_eval_rollouts",
+        )
+        final_eval_metrics.update(final_rollout_metrics)
+        wandb.log({
+            "eval/noise_loss":           final_eval_metrics["noise_loss"],
+            "eval/psnr":                 final_eval_metrics["psnr"],
+            "eval/ssim":                 final_eval_metrics["ssim"],
+            "eval/rollout_psnr":         final_eval_metrics["rollout_psnr"],
+            "eval/rollout_ssim":         final_eval_metrics["rollout_ssim"],
+            "eval/musiq":                final_eval_metrics["musiq"],
+            "eval/laion_aes":            final_eval_metrics["laion_aes"],
+            "eval/temporal_consistency": final_eval_metrics["temporal_consistency"],
+        }, step=global_step)
+        (save_dir / "final_eval_metrics.json").write_text(json.dumps(final_eval_metrics, indent=2))
+        print(f"Final eval: {json.dumps(final_eval_metrics, indent=2)}")
+
+        wandb.finish()
     if is_ddp:
         dist.destroy_process_group()
 
