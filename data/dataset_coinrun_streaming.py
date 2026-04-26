@@ -39,6 +39,7 @@ class CoinRunStreamingDataset(IterableDataset):
         seed: int = 42,
         ddp_rank: int = 0,
         ddp_world_size: int = 1,
+        skip_clips: int = 0,
     ) -> None:
         self.shard_dir = Path(shard_dir)
         self.clip_len = clip_len
@@ -46,6 +47,7 @@ class CoinRunStreamingDataset(IterableDataset):
         self.seed = seed
         self.ddp_rank = ddp_rank
         self.ddp_world_size = ddp_world_size
+        self.skip_clips = skip_clips   # clips to skip at start of iteration (for resume)
 
         self.shards = sorted(self.shard_dir.glob("*.array_record"))
         if not self.shards:
@@ -105,21 +107,41 @@ class CoinRunStreamingDataset(IterableDataset):
 
         rng.shuffle(shards)
 
-        for shard_path in shards:
-            yield from self._stream_shard(shard_path, ArrayRecordReader)
+        # fast-forward at shard level — no data reading for skipped shards
+        # divide skip_clips by num_workers: each worker owns 1/n of rank's shards
+        clips_per_shard = 100 * 17   # 100 episodes × 17 clips/episode (seq_len=160, cl=32, stride=8)
+        num_workers = worker.num_workers if worker is not None else 1
+        skip = self.skip_clips // num_workers
+        if skip > 0:
+            shards_to_skip = min(skip // clips_per_shard, len(shards))
+            shards = shards[shards_to_skip:]
+            skip = skip - shards_to_skip * clips_per_shard   # remaining clips within first shard
 
-    def _stream_shard(self, shard_path: Path, ArrayRecordReader) -> Iterator[dict]:
+        for shard_idx, shard_path in enumerate(shards):
+            clips_to_skip_in_shard = skip if shard_idx == 0 else 0
+            yield from self._stream_shard(shard_path, ArrayRecordReader, clips_to_skip_in_shard)
+
+    def _stream_shard(self, shard_path: Path, ArrayRecordReader, skip_clips: int = 0) -> Iterator[dict]:
         reader = ArrayRecordReader(str(shard_path))
         n = reader.num_records()
+        clips_seen = 0
 
-        for i in range(n):
-            raw = reader.read([i])[0]
-            rec = pickle.loads(raw)
-            T          = int(rec["sequence_length"])
-            frames_np  = np.frombuffer(rec["raw_video"], dtype=np.uint8).reshape(T, 64, 64, 3)
-            actions_np = np.asarray(rec["actions"], dtype=np.int64)  # [T]
+        try:
+            for i in range(n):
+                raw = reader.read([i])[0]
+                rec = pickle.loads(raw)
+                T          = int(rec["sequence_length"])
+                frames_np  = np.frombuffer(rec["raw_video"], dtype=np.uint8).reshape(T, 64, 64, 3)
+                actions_np = np.asarray(rec["actions"], dtype=np.int64)  # [T]
 
-            yield from self._clips(frames_np, actions_np, T)
+                for clip in self._clips(frames_np, actions_np, T):
+                    if clips_seen < skip_clips:
+                        clips_seen += 1
+                        continue
+                    yield clip
+                    clips_seen += 1
+        finally:
+            reader.close()  # explicit close to release C++ file handles and prevent abort()
 
     def _clips(
         self,

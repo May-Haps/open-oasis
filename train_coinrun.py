@@ -289,6 +289,7 @@ def save_checkpoint(
     step: int,
     val_loss: float | None,
     config: dict,
+    epoch_step: int = 0,
 ) -> None:
     torch.save({
         "model":     model.state_dict(),
@@ -296,6 +297,7 @@ def save_checkpoint(
         "scheduler": scheduler.state_dict(),
         "epoch":     epoch,
         "step":      step,
+        "epoch_step": epoch_step,
         "val_loss":  val_loss,
         "config":    config,
     }, path)
@@ -306,12 +308,12 @@ def load_checkpoint(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler,
-) -> tuple[int, int, float | None]:
+) -> tuple[int, int, float | None, int]:
     ckpt = torch.load(path, weights_only=True)
     model.load_state_dict(ckpt["model"])
     optimizer.load_state_dict(ckpt["optimizer"])
     scheduler.load_state_dict(ckpt["scheduler"])
-    return ckpt["epoch"], ckpt["step"], ckpt.get("val_loss")
+    return ckpt["epoch"], ckpt["step"], ckpt.get("val_loss"), ckpt.get("epoch_step", 0)
 
 
 # ---------------------------------------------------------------------------
@@ -352,54 +354,26 @@ def val_epoch(
     loader: DataLoader,
     noise_scheduler: NoiseScheduler,
     device: str,
-    alphas_cumprod: torch.Tensor | None = None,
     max_batches: int | None = None,
-) -> tuple[float, float, float]:
-    """Returns (val_loss, psnr, ssim). Pass max_batches for a fast subset check."""
+) -> float:
+    """Returns val_loss (MSE on v-prediction target)."""
     model.eval()
     loss_total, n = 0.0, 0
-    gt_frames, pred_frames = [], []
-
     for i, batch in enumerate(loader):
         if max_batches is not None and i >= max_batches:
             break
-        x0      = batch["frames"].to(device)          # [B, T, 3, 64, 64] in [0, 1]
+        x0      = batch["frames"].to(device)
         actions = batch["actions"].to(device)
         B, T    = x0.shape[:2]
         t       = torch.randint(0, noise_scheduler.timesteps, (B, T), device=device)
         noise   = torch.randn_like(x0)
-        x0_scaled = x0 * 2 - 1                        # [-1, 1]
-        xt, v_target = noise_scheduler.noised_sample_and_velocity_target(x0_scaled, t, noise)
+        xt, v_target = noise_scheduler.noised_sample_and_velocity_target(x0 * 2 - 1, t, noise)
         with autocast("cuda", dtype=torch.bfloat16):
             v_pred = model(xt, t, actions)
         loss_total += nn.functional.mse_loss(v_pred, v_target).item() * B
         n += B
-
-        # recover x0 prediction for pixel-space metrics
-        if alphas_cumprod is not None:
-            ac = alphas_cumprod[t]                     # [B, T, 1, 1, 1]
-            x0_pred = ac.sqrt() * xt - (1 - ac).sqrt() * v_pred.float()
-            # [B, T, 3, 64, 64] → [B*T, 64, 64, 3] uint8
-            x0_pred = ((x0_pred.clamp(-1, 1) + 1) / 2 * 255).byte()
-            x0_pred = x0_pred.permute(0, 1, 3, 4, 2).reshape(-1, 64, 64, 3).cpu().numpy()
-            x0_gt   = (x0 * 255).byte().permute(0, 1, 3, 4, 2).reshape(-1, 64, 64, 3).cpu().numpy()
-            gt_frames.append(x0_gt)
-            pred_frames.append(x0_pred)
-
     model.train()
-    val_loss = loss_total / n
-
-    if alphas_cumprod is None or not gt_frames:
-        return val_loss, float("nan"), float("nan")
-
-    gt_all   = np.concatenate(gt_frames,   axis=0).astype(np.float32)
-    pred_all = np.concatenate(pred_frames, axis=0).astype(np.float32)
-    psnr = peak_signal_noise_ratio(gt_all, pred_all, data_range=255)
-    ssim = float(np.mean([
-        structural_similarity(gt_all[i], pred_all[i], data_range=255, channel_axis=-1)
-        for i in range(len(gt_all))
-    ]))
-    return val_loss, psnr, ssim
+    return loss_total / n
 
 
 # ---------------------------------------------------------------------------
@@ -434,10 +408,11 @@ def main(args):
             entity=CONFIG["wandb_entity"],
             config=CONFIG,
             resume="allow",
-            id=wandb.util.generate_id() if not args.resume else None,
+            id=(save_dir / "wandb_run_id.txt").read_text().strip() if args.resume and (save_dir / "wandb_run_id.txt").exists() else wandb.util.generate_id(),
             dir=str(save_dir),
         )
         (save_dir / "wandb_run_id.txt").write_text(run.id)
+        wandb_resume_step = run.step   # last step already in wandb; skip logging below this
 
     # --- Model ---
     raw_model = CoinRunWorldModelSmall().to(device)
@@ -470,9 +445,9 @@ def main(args):
                                        ddp_rank=local_rank, ddp_world_size=world_size)
 
     train_loader = DataLoader(train_ds, batch_size=CONFIG["batch_size"],
-                              num_workers=16, pin_memory=True, multiprocessing_context="spawn")
+                              num_workers=2, pin_memory=True, multiprocessing_context="spawn")
     val_loader   = DataLoader(val_ds,   batch_size=CONFIG["batch_size"] // 4,
-                              num_workers=4, pin_memory=True, multiprocessing_context="spawn")
+                              num_workers=2, pin_memory=True, multiprocessing_context="spawn")
 
     # Pre-collect a pool of val clips for visual logging (rank 0 only)
     if is_main:
@@ -495,14 +470,41 @@ def main(args):
         return pf, pa, gt
 
     # --- Resume ---
-    start_epoch, global_step, best_val = 0, 0, float("inf")
+    start_epoch, global_step, best_val, resume_epoch_step = 0, 0, float("inf"), 0
     if args.resume:
-        start_epoch, global_step, best_val = load_checkpoint(
+        start_epoch, global_step, best_val, resume_epoch_step = load_checkpoint(
             args.resume, raw_model, optimizer, scheduler
         )
         best_val = best_val or float("inf")
+        if args.epoch_step is not None:
+            resume_epoch_step = args.epoch_step
         if is_main:
-            print(f"Resumed from {args.resume} (epoch={start_epoch}, step={global_step})")
+            _step_file = save_dir / "wandb_last_step.txt"
+            if _step_file.exists():
+                _last = int(_step_file.read_text().strip())
+                if _last > global_step:
+                    print(f"WandB last step ({_last}) ahead of checkpoint step ({global_step}) — advancing global_step")
+                    global_step = _last
+            print(f"Resumed from {args.resume} (epoch={start_epoch}, step={global_step}, epoch_step={resume_epoch_step})")
+    else:
+        resume_epoch_step = 0
+
+        # broadcast global_step from rank 0 so all ranks start at the same step
+        if is_ddp:
+            sync_tensor = torch.tensor([global_step, wandb_resume_step], device=device)
+            dist.broadcast(sync_tensor, src=0)
+            global_step = int(sync_tensor[0].item())
+            wandb_resume_step = int(sync_tensor[1].item())
+
+    # derive epoch position from global_step when old checkpoint has no epoch_step
+    if resume_epoch_step == 0 and args.resume:
+        steps_per_epoch = len(train_ds) // (CONFIG["batch_size"] * world_size)
+        resume_epoch_step = global_step % steps_per_epoch
+        if is_main:
+            print(f"Estimated epoch_step={resume_epoch_step} from global_step={global_step}")
+
+    # set dataset skip so resume continues within the epoch
+    train_ds.skip_clips = resume_epoch_step * CONFIG["batch_size"]
 
     if is_main:
         (save_dir / "config.json").write_text(json.dumps(CONFIG, indent=2))
@@ -515,12 +517,37 @@ def main(args):
     t0 = time.time()
 
     for epoch in range(start_epoch, CONFIG["epochs"]):
-        epoch_loss, epoch_steps = 0.0, 0
+        epoch_loss, epoch_steps = 0.0, resume_epoch_step if epoch == start_epoch else 0
+        resume_epoch_step = 0  # only skip on first resumed epoch
 
         total_batches = len(train_ds) // (CONFIG["batch_size"] * world_size)  # len() returns full dataset size; dataset already sharded by rank
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}", total=total_batches,
-                    dynamic_ncols=True, disable=not is_main)
-        for batch in pbar:
+                    initial=epoch_steps, dynamic_ncols=True, disable=not is_main)
+        pbar_iter = iter(pbar)
+        while True:
+            try:
+                batch = next(pbar_iter)
+            except StopIteration:
+                break
+            except RuntimeError as e:
+                if "worker" in str(e).lower() or "DataLoader" in str(e):
+                    if is_main:
+                        print(f"\n[step {global_step}] DataLoader worker died — using dummy batch to stay in sync, recreating loader")
+                    # Use dummy batch so DDP all_reduce still fires and step counts stay aligned
+                    batch = {
+                        "frames":  torch.zeros(CONFIG["batch_size"], CONFIG["clip_len"], 3, 64, 64),
+                        "actions": torch.zeros(CONFIG["batch_size"], CONFIG["clip_len"], 15),
+                    }
+                    # skip already-processed clips so epoch length stays correct
+                    train_ds.skip_clips = epoch_steps * CONFIG["batch_size"]
+                    train_loader = DataLoader(train_ds, batch_size=CONFIG["batch_size"],
+                                              num_workers=2, pin_memory=True, multiprocessing_context="spawn")
+                    pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}", total=total_batches,
+                                initial=epoch_steps, dynamic_ncols=True, disable=not is_main)
+                    pbar_iter = iter(pbar)
+                    # fall through to train_step — DO NOT continue
+                else:
+                    raise
             loss = train_step(
                 model, batch, noise_scheduler,
                 optimizer, scheduler, device, CONFIG["grad_clip"],
@@ -530,43 +557,66 @@ def main(args):
             epoch_steps  += 1
             pbar.set_postfix(loss=f"{loss:.4f}", step=global_step)
 
-            if is_main:
-                # --- Loss log ---
-                if global_step % CONFIG["log_every_steps"] == 0:
-                    elapsed = (time.time() - t0) / 3600
-                    wandb.log({
-                        "train/loss": loss,
-                        "train/lr":   scheduler.get_last_lr()[0],
-                        "perf/elapsed_hours": elapsed,
-                        "perf/steps_per_sec": global_step / (time.time() - t0),
-                    }, step=global_step)
+            # --- Proactive DataLoader worker restart every 5000 steps ---
+            # array_record C++ workers accumulate state and SIGABRT after ~9000 steps
+            if epoch_steps > 0 and epoch_steps % 5000 == 0:
+                train_ds.skip_clips = 0
+                train_loader = DataLoader(train_ds, batch_size=CONFIG["batch_size"],
+                                          num_workers=2, pin_memory=True, multiprocessing_context="spawn")
+                pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}", total=total_batches,
+                            initial=epoch_steps, dynamic_ncols=True, disable=not is_main)
+                pbar_iter = iter(pbar)
 
-                # --- Fast val loss (subset) ---
-                if global_step % CONFIG["val_every_steps"] == 0:
-                    fast_loss, _, _ = val_epoch(
-                        model, val_loader, noise_scheduler, device,
-                        alphas_cumprod=None,
-                        max_batches=CONFIG["val_subset_batches"],
-                    )
+            # --- Loss log (rank 0 only, no barrier needed — fast) ---
+            if is_main and global_step % CONFIG["log_every_steps"] == 0 and global_step > wandb_resume_step:
+                elapsed = (time.time() - t0) / 3600
+                wandb.log({
+                    "train/loss": loss,
+                    "train/lr":   scheduler.get_last_lr()[0],
+                    "perf/elapsed_hours": elapsed,
+                    "perf/steps_per_sec": global_step / (time.time() - t0),
+                }, step=global_step)
+                (save_dir / "wandb_last_step.txt").write_text(str(global_step))
+
+            # --- Fast val loss — barrier so both ranks run together ---
+            if global_step % CONFIG["val_every_steps"] == 0:
+                if is_ddp:
+                    dist.barrier()
+                fast_loss = val_epoch(
+                    model, val_loader, noise_scheduler, device,
+                    max_batches=CONFIG["val_subset_batches"],
+                )
+                if is_ddp:
+                    vt = torch.tensor(fast_loss, device=device)
+                    dist.all_reduce(vt, op=dist.ReduceOp.AVG)
+                    fast_loss = vt.item()
+                if is_main:
                     wandb.log({"val/loss": fast_loss}, step=global_step)
+                if is_ddp:
+                    dist.barrier()
 
-                # --- Checkpoint ---
-                if global_step % CONFIG["ckpt_every_steps"] == 0:
+            # --- Checkpoint — barrier so rank 1 waits for rank 0 to save ---
+            if global_step % CONFIG["ckpt_every_steps"] == 0:
+                if is_ddp:
+                    dist.barrier()
+                if is_main:
                     ckpt_path = str(save_dir / f"ckpt_step_{global_step:07d}.pt")
                     save_checkpoint(ckpt_path, raw_model, optimizer, scheduler,
-                                    epoch, global_step, None, CONFIG)
+                                    epoch, global_step, None, CONFIG, epoch_step=epoch_steps)
                     wandb.save(ckpt_path, base_path=str(save_dir))
                     print(f"[step {global_step}] checkpoint saved")
+                if is_ddp:
+                    dist.barrier()
 
-                # --- Rollout visual log ---
-                if global_step % CONFIG["rollout_every_steps"] == 0:
+            # --- Rollout — barrier so rank 1 waits during ~20s generation ---
+            if global_step % CONFIG["rollout_every_steps"] == 0:
+                if is_ddp:
+                    dist.barrier()
+                if is_main:
                     prompt_frames, prompt_actions, gt_uint8 = sample_val_prompts(global_step)
-
-                    # recover int action indices from one-hot
                     has_action    = prompt_actions.sum(dim=-1) > 0
                     action_idx    = prompt_actions.argmax(dim=-1)
-                    action_idx[~has_action] = 4   # NOOP for zero-pad frame
-
+                    action_idx[~has_action] = 4
                     generated = generate_rollout(
                         raw_model, prompt_frames, prompt_actions,
                         alphas_cumprod, device,
@@ -574,7 +624,6 @@ def main(args):
                         total_frames=CONFIG["rollout_frames"],
                         n_prompt=CONFIG["n_prompt_frames"],
                     )
-
                     rollout_dir = save_dir / "rollouts"
                     rollout_dir.mkdir(exist_ok=True)
                     local_path = str(rollout_dir / f"rollout_step_{global_step:07d}.mp4")
@@ -584,27 +633,28 @@ def main(args):
                         "rollout/grid":  wandb.Image(frames_to_grid(generated, gt_uint8)),
                     }, step=global_step)
                     print(f"[step {global_step}] rollout saved → {local_path}")
+                if is_ddp:
+                    dist.barrier()
 
         # --- End of epoch ---
+        train_ds.skip_clips = 0   # clear skip after first epoch
         avg_train_loss = epoch_loss / max(epoch_steps, 1)
-        val_loss, psnr, ssim = val_epoch(model, val_loader, noise_scheduler, device, alphas_cumprod)
+        val_loss = val_epoch(model, val_loader, noise_scheduler, device)
 
-        # aggregate metrics across ranks
+        # aggregate val loss across ranks
         if is_ddp:
-            metrics = torch.tensor([val_loss, psnr, ssim], device=device)
-            dist.all_reduce(metrics, op=dist.ReduceOp.AVG)
-            val_loss, psnr, ssim = metrics.tolist()
+            val_tensor = torch.tensor(val_loss, device=device)
+            dist.all_reduce(val_tensor, op=dist.ReduceOp.AVG)
+            val_loss = val_tensor.item()
 
         if is_main:
             wandb.log({
                 "epoch/train_loss": avg_train_loss,
                 "epoch/val_loss":   val_loss,
-                "epoch/psnr":       psnr,
-                "epoch/ssim":       ssim,
                 "epoch":            epoch + 1,
             }, step=global_step)
             print(f"Epoch {epoch+1} | train={avg_train_loss:.4f} val={val_loss:.4f} "
-                  f"PSNR={psnr:.2f} SSIM={ssim:.4f} | {(time.time()-t0)/3600:.2f}h elapsed")
+                  f"| {(time.time()-t0)/3600:.2f}h elapsed")
 
             ckpt_path = str(save_dir / f"ckpt_epoch_{epoch+1:03d}.pt")
             save_checkpoint(ckpt_path, raw_model, optimizer, scheduler,
@@ -629,4 +679,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--resume", type=str, default=None,
                         help="Path to checkpoint to resume from")
+    parser.add_argument("--epoch-step", type=int, default=None,
+                        help="Override epoch step position (batches done in current epoch)")
     main(parser.parse_args())
