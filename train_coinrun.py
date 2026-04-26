@@ -377,7 +377,7 @@ def main(args):
     CONFIG = {
         "train_dir":  "data/coinrun_raw/train",
         "val_dir":    "data/coinrun_raw/val",
-        "save_dir":   f"runs/coinrun_{args.model_size}",
+        "save_dir":   f"runs/coinrun_{args.model_size}_lin",
         "max_noise_level": 1000,
         "clip_len":   32,
         "clip_stride": 8,
@@ -400,7 +400,7 @@ def main(args):
         "n_rollout_samples":   4,
         "wandb_project": "coinrun-scaling",
         "wandb_entity":  "spring26-gen-ai",
-        "action_cond_mode": "one_hot_embedding",
+        "action_cond_mode": "linear",
         "eval_rollout_samples": 4,
     }
     # --- DDP setup ---
@@ -554,7 +554,13 @@ def main(args):
                     continue
 
             global_step  += 1
-            pbar.set_postfix(loss=f"{loss:.4f}", step=global_step)
+            elapsed = time.time() - t0
+            remaining = max(0, CONFIG["max_hours"] * 3600 - elapsed)
+            pbar.set_postfix(
+                loss=f"{loss:.4f}",
+                step=global_step,
+                eta=f"{remaining/3600:.1f}h",
+            )
 
             # ---- time-based stopping ----
             if (time.time() - t0) > CONFIG["max_hours"] * 3600:
