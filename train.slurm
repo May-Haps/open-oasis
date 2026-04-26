@@ -6,8 +6,8 @@
 #SBATCH --cpus-per-task=10
 #SBATCH --gres=gpu:h100-80:1
 #SBATCH --time=12:00:00
-#SBATCH --output=/ocean/projects/cis250234p/jyang45/open-oasis/runs/coinrun_v1/slurm_%j.out
-#SBATCH --error=/ocean/projects/cis250234p/jyang45/open-oasis/runs/coinrun_v1/slurm_%j.err
+#SBATCH --output=/ocean/projects/cis250234p/jyang45/open-oasis/runs/slurm_%j.out
+#SBATCH --error=/ocean/projects/cis250234p/jyang45/open-oasis/runs/slurm_%j.err
 
 PYTHON=/ocean/projects/cis250234p/jyang45/conda/envs/open-oasis/bin/python
 TORCHRUN=/ocean/projects/cis250234p/jyang45/conda/envs/open-oasis/bin/torchrun

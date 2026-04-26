@@ -25,13 +25,13 @@ Run a scaling law ablation across 5 model sizes (log-spaced from 5M to 57.8M par
 
 Log-spaced from 5M to 57.8M (ratio ≈ 1.84× each step).
 
-| Label | Actual params | hidden | depth | heads | Script |
+| Label | Actual params | hidden | depth | heads | Command |
 |---|---|---|---|---|---|
-| XS | ~5.5M | 160 | 6 | 4 | `train_coinrun_5M.py` (TODO) |
-| S | ~10.8M | 224 | 6 | 4 | `train_coinrun_9M.py` (TODO) |
-| M | ~18.4M | 288 | 6 | 8 | `train_coinrun_17M.py` ✓ |
-| L | ~31.9M | 384 | 6 | 8 | `train_coinrun_31M.py` ✓ |
-| XL | 57.8M | 512 | 6 | 8 | `train_coinrun.py` ✓ |
+| XS | ~5M | 160 | 5 | 8 | `python train_coinrun.py --model-size 5m` |
+| S | ~9M | 224 | 5 | 8 | `python train_coinrun.py --model-size 9m` |
+| M | ~18.4M | 288 | 6 | 8 | `torchrun --nproc_per_node=2 train_coinrun.py --model-size 17m` |
+| L | ~31.9M | 384 | 6 | 8 | `torchrun --nproc_per_node=2 train_coinrun.py --model-size 31m` |
+| XL | 57.8M | 512 | 6 | 8 | `torchrun --nproc_per_node=2 train_coinrun.py --model-size small` |
 
 Use the **actual** param count when plotting, not the label.
 
@@ -101,28 +101,20 @@ Both well within 80 GB H100 limit.
 
 ---
 
-## Existing training scripts
+## Training commands
 
-### `train_coinrun_17M.py`
-- Model: hidden=288, depth=6, heads=8 → **18.4M params** (label says 17M)
-- `epochs=6`, `save_dir=runs/coinrun_17M`, `wandb_name=ablation-17M`
-- Run: `torchrun --nproc_per_node=2 train_coinrun_17M.py`
+All model sizes now use `train_coinrun.py`.
 
-### `train_coinrun_31M.py`
-- Model: hidden=384, depth=6, heads=8 → **31.9M params**
-- `epochs=4`, `save_dir=runs/coinrun_31M`, `wandb_name=ablation-31M`
-- Run: `torchrun --nproc_per_node=2 train_coinrun_31M.py`
-
-### Run sequentially (only 2 GPUs available):
+Run sequentially when only 2 GPUs are available:
 ```bash
-torchrun --nproc_per_node=2 train_coinrun_17M.py && \
-torchrun --nproc_per_node=2 train_coinrun_31M.py
+python train_coinrun.py --model-size 5m --max-hours 18
+python train_coinrun.py --model-size 9m --max-hours 15
+torchrun --nproc_per_node=2 train_coinrun.py --model-size 17m --max-hours 9
+torchrun --nproc_per_node=2 train_coinrun.py --model-size 31m --max-hours 9
+torchrun --nproc_per_node=2 train_coinrun.py --model-size small --max-hours 12
 ```
 
-### TODO: create scripts for XS (5M) and S (9M)
-- Use `python train_coinrun_XM.py` (single GPU, no torchrun)
-- Set `batch_size=256` in CONFIG
-- Epochs: ~19 for XS, ~10 for S
+The script keeps effective batch size at 256 by deriving gradient accumulation from `world_size`.
 
 ---
 

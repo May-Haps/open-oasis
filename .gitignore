@@ -54,3 +54,5 @@ cmds.txt
 # --- Cache ---
 .cache/
 .gradio/
+.mypy_cache/
+.codex

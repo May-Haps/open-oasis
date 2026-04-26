@@ -3,8 +3,8 @@
 Quick CoinRun inference from a checkpoint.
 
 Usage:
-    python infer_coinrun.py --ckpt runs/coinrun_v1/ckpt_step_0004000.pt
-    python infer_coinrun.py --ckpt runs/coinrun_v1/ckpt_step_0004000.pt \
+    python infer_coinrun.py --ckpt runs/coinrun_small_lin/ckpt_step_0004000.pt
+    python infer_coinrun.py --ckpt runs/coinrun_small_lin/ckpt_step_0004000.pt \
         --frames 32 --n-samples 4 --output generated.mp4
 
 Action selection:
@@ -30,7 +30,7 @@ from model.utils import sigmoid_beta_schedule
 from train_coinrun import generate_rollout
 
 DEVICE   = "cuda" if torch.cuda.is_available() else "cpu"
-DATA_DIR = "data/coinrun/val"
+DATA_DIR = "data/coinrun_raw/val"
 
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 try:
@@ -179,12 +179,18 @@ def main(args: argparse.Namespace) -> None:
     print(f"Action source : {args.action_source}")
     print(f"Device        : {DEVICE}")
 
-    model = CoinRunWorldModelSmall().to(DEVICE)
     ckpt  = torch.load(args.ckpt, weights_only=True, map_location=DEVICE)
+    ckpt_config = ckpt.get("config", {}) if isinstance(ckpt, dict) else {}
+    action_cond_mode = ckpt_config.get("action_cond_mode", "linear")
+
+    model = CoinRunWorldModelSmall(
+        external_cond_mode=action_cond_mode,
+    ).to(DEVICE)
     model.load_state_dict(ckpt["model"])
     model.eval()
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
     print(f"Params        : {n_params:.1f}M  (step={ckpt.get('step')}, epoch={ckpt.get('epoch')})")
+    print(f"Action cond   : mode={action_cond_mode}")
 
     betas          = sigmoid_beta_schedule(1000).float().to(DEVICE)
     alphas_cumprod = rearrange(torch.cumprod(1.0 - betas, dim=0), "T -> T 1 1 1")

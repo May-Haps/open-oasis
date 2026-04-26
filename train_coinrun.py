@@ -12,7 +12,7 @@ Run:
     python train_coinrun.py
 
 Resume from checkpoint:
-    python train_coinrun.py --resume runs/coinrun_v1/ckpt_step_10000.pt
+    python train_coinrun.py --model-size 5m --resume runs/coinrun_5m_lin/ckpt_step_10000.pt
 """
 
 from __future__ import annotations
@@ -39,51 +39,17 @@ from torch.utils.data import DataLoader
 from torchvision.utils import make_grid
 
 from data.dataset_coinrun_streaming import CoinRunStreamingDataset
-from model.dit import CoinRunWorldModel, CoinRunWorldModelSmall
+from model.dit import (
+    CoinRunWorldModel5M,
+    CoinRunWorldModel9M,
+    CoinRunWorldModel17M,
+    CoinRunWorldModel31M,
+    CoinRunWorldModelSmall,
+)
 from model.utils import sigmoid_beta_schedule
 from training.noise_scheduler import NoiseScheduler
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-CONFIG = {
-    # Paths
-    "train_dir":  "data/coinrun/train",
-    "val_dir":    "data/coinrun/val",
-    "save_dir":   "runs/coinrun_v1",
-
-    # Model
-    "max_noise_level": 1000,
-
-    # Data
-    "clip_len":   32,
-    "clip_stride": 8,
-
-    # Training
-    "epochs":          10,       # stop early if time budget hit; checkpoints preserve progress
-    "batch_size":      128,
-    "lr":              1e-4,
-    "weight_decay":    0.01,
-    "warmup_steps":    2000,
-    "grad_clip":       1.0,
-
-    # Logging / saving
-    "ckpt_every_steps":    10000,  # checkpoint every ~8 min at ~20 it/s
-    "rollout_every_steps": 1000,   # generate + log video every ~1k steps
-    "val_every_steps":     5000,   # fast val loss (subset) every N steps
-    "val_subset_batches":  50,     # how many val batches for the fast check (~8s)
-    "log_every_steps":     50,     # wandb loss every N steps
-
-    # Rollout generation
-    "ddim_steps":          10,
-    "n_prompt_frames":     1,
-    "rollout_frames":      16,     # frames to generate per sample
-    "n_rollout_samples":   4,      # how many val clips to visualise
-
-    # WandB
-    "wandb_project": "coinrun-world-model",
-    "wandb_entity":  "spring26-gen-ai",
-}
+from eval import evaluate_noise_loss_and_recon, evaluate_rollouts
 
 
 # ---------------------------------------------------------------------------
@@ -327,25 +293,33 @@ def train_step(
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     device: str,
     grad_clip: float,
-) -> float:
+    accum_step: int,        # which micro-step within the accumulation window (0-indexed)
+    grad_accum_steps: int,  # total micro-steps before an optimizer update
+) -> tuple[float, bool]:
     x0      = batch["frames"].to(device)
     actions = batch["actions"].to(device)
     B, T    = x0.shape[:2]
 
-    optimizer.zero_grad()
+
     t     = torch.randint(0, noise_scheduler.timesteps, (B, T), device=device)
     noise = torch.randn_like(x0)
     xt, v_target = noise_scheduler.noised_sample_and_velocity_target(x0 * 2 - 1, t, noise)
 
     with autocast("cuda", dtype=torch.bfloat16):
         v_pred = model(xt, t, actions)
-        loss = nn.functional.mse_loss(v_pred, v_target)
+        loss = nn.functional.mse_loss(v_pred, v_target) / grad_accum_steps
 
     loss.backward()
-    nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    optimizer.step()
-    scheduler.step()
-    return loss.item()
+    stepped = False
+
+    if (accum_step + 1) % grad_accum_steps == 0:
+        nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad()
+        stepped = True
+
+    return loss.item() * grad_accum_steps, stepped
 
 
 @torch.no_grad()
@@ -380,6 +354,38 @@ def val_epoch(
 # Main
 # ---------------------------------------------------------------------------
 def main(args):
+    CONFIG = {
+        "train_dir":  "data/coinrun_raw/train",
+        "val_dir":    "data/coinrun_raw/val",
+        "save_dir":   f"runs/coinrun_{args.model_size}_lin",
+        "model_size": args.model_size,
+        "max_noise_level": 1000,
+        "clip_len":   32,
+        "clip_stride": 8,
+        "epochs":     999,          # effectively unlimited — time stops the run
+        "batch_size": 128,          # per-step batch (physical)
+        "effective_batch_size": 256,
+        "grad_accum_steps": 2,      # recalculated after DDP setup
+        "lr":         1e-4,
+        "weight_decay": 0.01,
+        "warmup_steps": 2000,
+        "grad_clip":  1.0,
+        "max_hours":  args.max_hours,
+        "ckpt_every_steps":    10000,
+        "rollout_every_steps": 1000,
+        "val_every_steps":     5000,
+        "val_subset_batches":  50,
+        "log_every_steps":     50,
+        "ddim_steps":          10,
+        "n_prompt_frames":     1,
+        "rollout_frames":      16,
+        "n_rollout_samples":   4,
+        "wandb_project": "coinrun-scaling",
+        "wandb_entity":  "spring26-gen-ai",
+        "wandb_name":    f"ablation-{args.model_size}-lin",
+        "action_cond_mode": "linear",
+        "eval_rollout_samples": 4,
+    }
     # --- DDP setup ---
     is_ddp = "LOCAL_RANK" in os.environ
     if is_ddp:
@@ -396,26 +402,56 @@ def main(args):
         is_main = True
 
     assert torch.cuda.is_available(), "CUDA required"
+    per_optimizer_step = CONFIG["batch_size"] * world_size
+    if CONFIG["effective_batch_size"] % per_optimizer_step != 0:
+        raise ValueError(
+            "effective_batch_size must be divisible by batch_size * world_size "
+            f"({CONFIG['effective_batch_size']} vs {per_optimizer_step})"
+        )
+    CONFIG["grad_accum_steps"] = CONFIG["effective_batch_size"] // per_optimizer_step
+
+    model_config = dict(CONFIG)
+    if args.resume:
+        resume_ckpt = torch.load(args.resume, weights_only=True, map_location="cpu")
+        resume_config = resume_ckpt.get("config", {})
+        model_config["action_cond_mode"] = resume_config.get("action_cond_mode", "linear")
 
     save_dir = Path(CONFIG["save_dir"])
     if is_main:
         save_dir.mkdir(parents=True, exist_ok=True)
 
     # --- WandB (rank 0 only) ---
+    wandb_resume_step = 0
     if is_main:
+        wandb_id_file = save_dir / "wandb_run_id.txt"
+        if args.resume and wandb_id_file.exists():
+            wandb_id = wandb_id_file.read_text().strip()
+        else:
+            wandb_id = wandb.util.generate_id()
+
         run = wandb.init(
             project=CONFIG["wandb_project"],
             entity=CONFIG["wandb_entity"],
-            config=CONFIG,
+            config=model_config,
             resume="allow",
-            id=(save_dir / "wandb_run_id.txt").read_text().strip() if args.resume and (save_dir / "wandb_run_id.txt").exists() else wandb.util.generate_id(),
+            name=CONFIG.get("wandb_name"),
+            id=wandb_id,
             dir=str(save_dir),
         )
         (save_dir / "wandb_run_id.txt").write_text(run.id)
         wandb_resume_step = run.step   # last step already in wandb; skip logging below this
 
     # --- Model ---
-    raw_model = CoinRunWorldModelSmall().to(device)
+    model_map = {
+        "5m":    CoinRunWorldModel5M,
+        "9m":    CoinRunWorldModel9M,
+        "17m":   CoinRunWorldModel17M,
+        "31m":   CoinRunWorldModel31M,
+        "small": CoinRunWorldModelSmall,
+    }
+    raw_model = model_map[args.model_size](
+        external_cond_mode=model_config["action_cond_mode"],
+    ).to(device)
     if is_main:
         print(f"Parameters: {sum(p.numel() for p in raw_model.parameters()) / 1e6:.1f}M")
     model = DDP(raw_model, device_ids=[local_rank]) if is_ddp else raw_model
@@ -489,17 +525,18 @@ def main(args):
     else:
         resume_epoch_step = 0
 
-        # broadcast global_step from rank 0 so all ranks start at the same step
-        if is_ddp:
-            sync_tensor = torch.tensor([global_step, wandb_resume_step], device=device)
-            dist.broadcast(sync_tensor, src=0)
-            global_step = int(sync_tensor[0].item())
-            wandb_resume_step = int(sync_tensor[1].item())
+    # broadcast rank-0 step decisions so all ranks resume from the same place
+    if is_ddp:
+        sync_tensor = torch.tensor([global_step, wandb_resume_step, resume_epoch_step], device=device)
+        dist.broadcast(sync_tensor, src=0)
+        global_step = int(sync_tensor[0].item())
+        wandb_resume_step = int(sync_tensor[1].item())
+        resume_epoch_step = int(sync_tensor[2].item())
 
     # derive epoch position from global_step when old checkpoint has no epoch_step
     if resume_epoch_step == 0 and args.resume:
         steps_per_epoch = len(train_ds) // (CONFIG["batch_size"] * world_size)
-        resume_epoch_step = global_step % steps_per_epoch
+        resume_epoch_step = (global_step * CONFIG["grad_accum_steps"]) % steps_per_epoch
         if is_main:
             print(f"Estimated epoch_step={resume_epoch_step} from global_step={global_step}")
 
@@ -507,18 +544,23 @@ def main(args):
     train_ds.skip_clips = resume_epoch_step * CONFIG["batch_size"]
 
     if is_main:
-        (save_dir / "config.json").write_text(json.dumps(CONFIG, indent=2))
+        (save_dir / "config.json").write_text(json.dumps(model_config, indent=2))
 
     if is_ddp:
         dist.barrier()
 
     # --- Training loop ---
+    optimizer.zero_grad()
     model.train()
     t0 = time.time()
 
+    time_up = False
+
     for epoch in range(start_epoch, CONFIG["epochs"]):
-        epoch_loss, epoch_steps = 0.0, resume_epoch_step if epoch == start_epoch else 0
-        resume_epoch_step = 0  # only skip on first resumed epoch
+        epoch_loss = 0.0
+        epoch_loss_steps = 0
+        epoch_steps = resume_epoch_step if epoch == start_epoch else 0
+        resume_epoch_step = 0
 
         total_batches = len(train_ds) // (CONFIG["batch_size"] * world_size)  # len() returns full dataset size; dataset already sharded by rank
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}", total=total_batches,
@@ -532,51 +574,72 @@ def main(args):
             except RuntimeError as e:
                 if "worker" in str(e).lower() or "DataLoader" in str(e):
                     if is_main:
-                        print(f"\n[step {global_step}] DataLoader worker died — using dummy batch to stay in sync, recreating loader")
-                    # Use dummy batch so DDP all_reduce still fires and step counts stay aligned
+                        print(f"\n[step {global_step}] DataLoader worker died; using dummy batch and recreating loader")
                     batch = {
                         "frames":  torch.zeros(CONFIG["batch_size"], CONFIG["clip_len"], 3, 64, 64),
                         "actions": torch.zeros(CONFIG["batch_size"], CONFIG["clip_len"], 15),
                     }
-                    # skip already-processed clips so epoch length stays correct
                     train_ds.skip_clips = epoch_steps * CONFIG["batch_size"]
                     train_loader = DataLoader(train_ds, batch_size=CONFIG["batch_size"],
                                               num_workers=2, pin_memory=True, multiprocessing_context="spawn")
                     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}", total=total_batches,
                                 initial=epoch_steps, dynamic_ncols=True, disable=not is_main)
                     pbar_iter = iter(pbar)
-                    # fall through to train_step — DO NOT continue
                 else:
                     raise
-            loss = train_step(
+
+            loss, did_step = train_step(
                 model, batch, noise_scheduler,
                 optimizer, scheduler, device, CONFIG["grad_clip"],
+                accum_step=epoch_steps,
+                grad_accum_steps=CONFIG["grad_accum_steps"],
             )
-            global_step  += 1
-            epoch_loss   += loss
-            epoch_steps  += 1
-            pbar.set_postfix(loss=f"{loss:.4f}", step=global_step)
+            epoch_loss  += loss
+            epoch_loss_steps += 1
+            epoch_steps += 1
 
-            # --- Proactive DataLoader worker restart every 5000 steps ---
-            # array_record C++ workers accumulate state and SIGABRT after ~9000 steps
+            if not did_step:
+                continue
+
+            global_step  += 1
+            elapsed = time.time() - t0
+            remaining = max(0, CONFIG["max_hours"] * 3600 - elapsed)
+            pbar.set_postfix(
+                loss=f"{loss:.4f}",
+                step=global_step,
+                eta=f"{remaining/3600:.1f}h",
+            )
+
+            # ---- time-based stopping ----
+            if (time.time() - t0) > CONFIG["max_hours"] * 3600:
+                if is_main:
+                    print(f"Reached {CONFIG['max_hours']}h limit at step {global_step}, stopping.")
+                time_up = True
+                break
+
+            if is_main:
+                # --- Loss log ---
+                if global_step % CONFIG["log_every_steps"] == 0 and global_step > wandb_resume_step:
+                    n_params = sum(p.numel() for p in raw_model.parameters())
+                    flops_per_eff_step = 6 * n_params * CONFIG["effective_batch_size"] * CONFIG["clip_len"]
+                    elapsed = (time.time() - t0) / 3600
+                    wandb.log({
+                        "train/loss":             loss,
+                        "train/lr":               scheduler.get_last_lr()[0],
+                        "train/cumulative_flops": flops_per_eff_step * global_step,
+                        "perf/elapsed_hours":     elapsed,
+                        "perf/steps_per_sec":     global_step / (time.time() - t0),
+                    }, step=global_step)
+                    (save_dir / "wandb_last_step.txt").write_text(str(global_step))
+
+            # --- Proactive DataLoader worker restart every 5000 micro-batches ---
             if epoch_steps > 0 and epoch_steps % 5000 == 0:
-                train_ds.skip_clips = 0
+                train_ds.skip_clips = epoch_steps * CONFIG["batch_size"]
                 train_loader = DataLoader(train_ds, batch_size=CONFIG["batch_size"],
                                           num_workers=2, pin_memory=True, multiprocessing_context="spawn")
                 pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}", total=total_batches,
                             initial=epoch_steps, dynamic_ncols=True, disable=not is_main)
                 pbar_iter = iter(pbar)
-
-            # --- Loss log (rank 0 only, no barrier needed — fast) ---
-            if is_main and global_step % CONFIG["log_every_steps"] == 0 and global_step > wandb_resume_step:
-                elapsed = (time.time() - t0) / 3600
-                wandb.log({
-                    "train/loss": loss,
-                    "train/lr":   scheduler.get_last_lr()[0],
-                    "perf/elapsed_hours": elapsed,
-                    "perf/steps_per_sec": global_step / (time.time() - t0),
-                }, step=global_step)
-                (save_dir / "wandb_last_step.txt").write_text(str(global_step))
 
             # --- Fast val loss — barrier so both ranks run together ---
             if global_step % CONFIG["val_every_steps"] == 0:
@@ -602,7 +665,7 @@ def main(args):
                 if is_main:
                     ckpt_path = str(save_dir / f"ckpt_step_{global_step:07d}.pt")
                     save_checkpoint(ckpt_path, raw_model, optimizer, scheduler,
-                                    epoch, global_step, None, CONFIG, epoch_step=epoch_steps)
+                                    epoch, global_step, None, model_config, epoch_step=epoch_steps)
                     wandb.save(ckpt_path, base_path=str(save_dir))
                     print(f"[step {global_step}] checkpoint saved")
                 if is_ddp:
@@ -636,9 +699,12 @@ def main(args):
                 if is_ddp:
                     dist.barrier()
 
+        if time_up:
+            break
+
         # --- End of epoch ---
         train_ds.skip_clips = 0   # clear skip after first epoch
-        avg_train_loss = epoch_loss / max(epoch_steps, 1)
+        avg_train_loss = epoch_loss / max(epoch_loss_steps, 1)
         val_loss = val_epoch(model, val_loader, noise_scheduler, device)
 
         # aggregate val loss across ranks
@@ -658,18 +724,59 @@ def main(args):
 
             ckpt_path = str(save_dir / f"ckpt_epoch_{epoch+1:03d}.pt")
             save_checkpoint(ckpt_path, raw_model, optimizer, scheduler,
-                            epoch + 1, global_step, val_loss, CONFIG)
+                            epoch + 1, global_step, val_loss, model_config)
             wandb.save(ckpt_path, base_path=str(save_dir))
 
             if val_loss < best_val:
                 best_val = val_loss
                 best_path = str(save_dir / "ckpt_best.pt")
                 save_checkpoint(best_path, raw_model, optimizer, scheduler,
-                                epoch + 1, global_step, val_loss, CONFIG)
+                                epoch + 1, global_step, val_loss, model_config)
                 wandb.save(best_path, base_path=str(save_dir))
                 print(f"  ↳ new best val loss: {best_val:.4f}")
 
+    if is_ddp:
+        dist.barrier()
+
     if is_main:
+        final_ckpt = str(save_dir / f"ckpt_step_{global_step:07d}_final.pt")
+        save_checkpoint(final_ckpt, raw_model, optimizer, scheduler,
+                        epoch, global_step, None, model_config)
+        print(f"Final checkpoint saved → {final_ckpt}")
+
+        final_eval_metrics = evaluate_noise_loss_and_recon(
+            model=raw_model,
+            loader=val_loader,
+            noise_scheduler=noise_scheduler,
+            device=device,
+            max_noise_level=CONFIG["max_noise_level"],
+            max_batches=None,
+        )
+        final_rollout_metrics = evaluate_rollouts(
+            model=raw_model,
+            dataset=val_ds,
+            device=device,
+            max_noise_level=CONFIG["max_noise_level"],
+            ddim_steps=CONFIG["ddim_steps"],
+            n_prompt_frames=CONFIG["n_prompt_frames"],
+            rollout_frames=CONFIG["rollout_frames"],
+            num_samples=CONFIG["eval_rollout_samples"],
+            save_dir=save_dir / "final_eval_rollouts",
+        )
+        final_eval_metrics.update(final_rollout_metrics)
+        wandb.log({
+            "eval/noise_loss":           final_eval_metrics["noise_loss"],
+            "eval/psnr":                 final_eval_metrics["psnr"],
+            "eval/ssim":                 final_eval_metrics["ssim"],
+            "eval/rollout_psnr":         final_eval_metrics["rollout_psnr"],
+            "eval/rollout_ssim":         final_eval_metrics["rollout_ssim"],
+            "eval/musiq":                final_eval_metrics["musiq"],
+            "eval/laion_aes":            final_eval_metrics["laion_aes"],
+            "eval/temporal_consistency": final_eval_metrics["temporal_consistency"],
+        }, step=global_step)
+        (save_dir / "final_eval_metrics.json").write_text(json.dumps(final_eval_metrics, indent=2))
+        print(f"Final eval: {json.dumps(final_eval_metrics, indent=2)}")
+
         wandb.finish()
     if is_ddp:
         dist.destroy_process_group()
@@ -677,6 +784,8 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("--model-size", choices=["5m", "9m", "17m", "31m", "small"], default="small")
+    parser.add_argument("--max-hours", type=float, default=12.0)
     parser.add_argument("--resume", type=str, default=None,
                         help="Path to checkpoint to resume from")
     parser.add_argument("--epoch-step", type=int, default=None,

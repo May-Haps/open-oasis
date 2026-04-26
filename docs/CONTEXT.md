@@ -69,7 +69,8 @@ open-oasis/
   train_coinrun.py                # Main CoinRun training script — USE THIS
   train.py                        # Legacy Mario training script
   setup.sh                        # Creates /venv/open-oasis venv and installs all deps
-  CONTEXT.md
+  docs/CONTEXT.md
+  docs/SCALING_ABLATION.md
 ```
 
 **Python env:** `/venv/open-oasis/bin/python3` (NOT conda, NOT system python)

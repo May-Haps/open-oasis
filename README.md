@@ -29,10 +29,14 @@ The model is a **Spatiotemporal Diffusion Transformer (DiT)** with alternating s
 
 | Variant | Params | Hidden size | Depth | Heads |
 |---|---|---|---|---|
-| `CoinRunWorldModelSmall` (**current**) | 57.8M | 512 | 6 | 8 |
+| `5m` | ~5M | 160 | 5 | 8 |
+| `9m` | ~9M | 224 | 5 | 8 |
+| `17m` | ~18M | 288 | 6 | 8 |
+| `31m` | ~32M | 384 | 6 | 8 |
+| `small` | 57.8M | 512 | 6 | 8 |
 | `CoinRunWorldModel` | ~100M | 640 | 8 | 8 |
 
-Both variants live in `model/dit.py`. Training uses `CoinRunWorldModelSmall`.
+All CoinRun variants live in `model/dit.py` and are selected with `train_coinrun.py --model-size`.
 
 ---
 
@@ -79,7 +83,7 @@ This creates a venv at `/venv/open-oasis` with all dependencies (PyTorch, av, wa
 ```bash
 source /venv/open-oasis/bin/activate
 
-huggingface-cli download --repo-type dataset p-doom/coinrun-dataset \
+hf download --repo-type dataset p-doom/coinrun-dataset \
     --local-dir data/coinrun
 ```
 
@@ -102,20 +106,26 @@ The dataset is ~60 GB (612,900 episodes × 160 frames, stored as Google ArrayRec
 
 ## Training
 
-### Single GPU
+`train_coinrun.py` is the single training entry point for all scaling runs. It keeps the effective batch size at 256 by deriving gradient accumulation from the GPU count.
+
+### Single GPU — 5M / 9M
 
 ```bash
-/venv/open-oasis/bin/python3 train_coinrun.py
+/venv/open-oasis/bin/python3 train_coinrun.py --model-size 5m --max-hours 18
+/venv/open-oasis/bin/python3 train_coinrun.py --model-size 9m --max-hours 15
 ```
 
-### DDP — 2× H100 (recommended)
+### DDP — 17M / 31M / 57.8M
 
 ```bash
-torchrun --nproc_per_node=2 train_coinrun.py
+torchrun --nproc_per_node=2 train_coinrun.py --model-size 17m --max-hours 9
+torchrun --nproc_per_node=2 train_coinrun.py --model-size 31m --max-hours 9
+torchrun --nproc_per_node=2 train_coinrun.py --model-size small --max-hours 12
 
 # Resume from checkpoint
 torchrun --nproc_per_node=2 train_coinrun.py \
-    --resume runs/coinrun_v1/ckpt_step_0110000.pt
+    --model-size small \
+    --resume runs/coinrun_small_lin/ckpt_step_0110000.pt
 ```
 
 At ~3.3 it/s on 2× H100 SXM, one epoch takes ~3.4 hours (~40,700 steps with bs=128×2).
@@ -124,15 +134,13 @@ At ~3.3 it/s on 2× H100 SXM, one epoch takes ~3.4 hours (~40,700 steps with bs=
 
 ```python
 CONFIG = {
-    "batch_size":          128,     # per GPU
-    "clip_len":            32,      # frames per training sample
-    "epochs":              10,
-    "lr":                  1e-4,
-    "ckpt_every_steps":    10000,
-    "rollout_every_steps": 1000,    # generate video every N steps
-    "val_every_steps":     5000,    # fast val loss check (50 batches)
-    "wandb_project":       "coinrun-world-model",
-    "wandb_entity":        "your-entity",   # ← set this
+    "batch_size":           128,     # physical batch per process
+    "effective_batch_size": 256,
+    "clip_len":             32,
+    "lr":                   1e-4,
+    "max_hours":            args.max_hours,
+    "wandb_project":        "coinrun-scaling",
+    "action_cond_mode":     "linear",
 }
 ```
 
@@ -156,12 +164,12 @@ CONFIG = {
 
 ```bash
 /venv/open-oasis/bin/python3 scripts/infer_coinrun.py \
-    --ckpt runs/coinrun_v1/ckpt_step_0110000.pt \
+    --ckpt runs/coinrun_small_lin/ckpt_step_0110000.pt \
     --frames 32 --n-samples 4 --output generated.mp4
 
 # Use random actions instead of ground-truth val actions
 /venv/open-oasis/bin/python3 scripts/infer_coinrun.py \
-    --ckpt runs/coinrun_v1/ckpt_step_0110000.pt \
+    --ckpt runs/coinrun_small_lin/ckpt_step_0110000.pt \
     --action-source random --frames 64
 ```
 
@@ -171,7 +179,7 @@ Output: 4 samples side-by-side — GT frame on top, generated on bottom, keyboar
 
 ```bash
 /venv/open-oasis/bin/python3 scripts/interactive.py \
-    --ckpt runs/coinrun_v1/ckpt_step_0110000.pt --share
+    --ckpt runs/coinrun_small_lin/ckpt_step_0110000.pt --share
 ```
 
 Opens a Gradio web UI (public share URL valid 1 week). Choose actions with arrow buttons, step frame-by-frame, record and download episodes as mp4.
@@ -234,6 +242,9 @@ open-oasis/
     visualize_dataset.py          # Dataset visualization → mp4
     upload_checkpoints.py         # HuggingFace upload utility
     generate.py                   # Legacy Mario inference
+  docs/
+    CONTEXT.md                    # Development context snapshot
+    SCALING_ABLATION.md           # Scaling-run notes
   train_coinrun.py                # Main training script
   train.py                        # Legacy Mario training
   episodes/                       # Generated episode videos

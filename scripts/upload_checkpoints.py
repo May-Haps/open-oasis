@@ -44,5 +44,5 @@ if __name__ == "__main__":
     parser.add_argument("--token",   required=True, help="HuggingFace token (hf_...)")
     parser.add_argument("--repo",    required=True, help="HF repo, e.g. your-username/coinrunm")
     parser.add_argument("--folder",  default="baseline", help="Subfolder in repo (default: baseline)")
-    parser.add_argument("--run-dir", default="runs/coinrun_v1", help="Local dir with .pt files")
+    parser.add_argument("--run-dir", default="runs/coinrun_small_lin", help="Local dir with .pt files")
     main(parser.parse_args())
